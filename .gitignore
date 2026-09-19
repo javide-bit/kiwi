@@ -1,0 +1,34 @@
+# Bytecode y cachés de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Salidas de KIWI
+KIWI_informe_*.csv
+*_assets/
+markdown_export/
+markdown_web/
+
+# Sistema operativo / editores
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# Listas y enlaces locales
+*.urls
+urls_*.txt
+urls_*.md
+*.zip
+
+# Artefactos de compilacion (PyInstaller)
+build/
+dist/
+*.spec

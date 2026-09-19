@@ -1,0 +1,9 @@
+# Dependencias principales de KIWI (con pdfmd)
+pymupdf>=1.23.0
+Pillow>=10.0.0
+
+# OCR opcional. Requiere ademas el binario correspondiente en el sistema:
+#   - Tesseract  (OCR pagina a pagina)      -> https://github.com/tesseract-ocr/tesseract
+#   - OCRmyPDF   (OCR del documento entero) -> https://ocrmypdf.readthedocs.io
+# pytesseract>=0.3.10
+# ocrmypdf>=15.0.0
