@@ -14,7 +14,9 @@ sobre el resultado de nuestra decodificacion.
 import hashlib
 import os
 import re
+import socket
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +25,7 @@ from datetime import datetime
 from typing import Optional
 
 from htmlmd.models import WebOptions
+from pdfmd.utils import leer_url_origen
 
 
 @dataclass
@@ -37,6 +40,8 @@ class Respuesta:
     encoding: str = ""
     sha256: str = ""
     fecha_captura: str = ""
+    ruta_local: str = ""         # Fichero .html de disco, si no vino de la red
+    fecha_archivo: str = ""      # mtime del fichero local: no es la fecha de captura
 
 
 class ErrorDeDescarga(Exception):
@@ -105,36 +110,70 @@ def _contexto_ssl(verificar: bool) -> Optional[ssl.SSLContext]:
     return ctx
 
 
+def _es_error_transitorio(ex: Exception) -> bool:
+    """True si el error es un timeout o un estado HTTP transitorio (429, 500, 502, 503, 504)."""
+    if isinstance(ex, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(ex, urllib.error.HTTPError):
+        return ex.code in (408, 429, 500, 502, 503, 504)
+    if isinstance(ex, urllib.error.URLError):
+        razon = str(getattr(ex, "reason", ex)).lower()
+        if any(p in razon for p in ("timed out", "timeout", "temporarily", "reset by peer", "connection reset")):
+            return True
+    if isinstance(ex, OSError):
+        msg = str(ex).lower()
+        if "timed out" in msg or "timeout" in msg:
+            return True
+    return False
+
+
 def descargar(url: str, options: Optional[WebOptions] = None) -> Respuesta:
-    """Descarga una URL siguiendo redirecciones. Lanza ErrorDeDescarga si no hay pagina."""
+    """Descarga una URL siguiendo redirecciones y reintentando en timeouts. Lanza ErrorDeDescarga si falla."""
     opts = options or WebOptions()
+    intentos_max = 1 + max(0, int(getattr(opts, "reintentos", 2) or 0))
+    espera_base = max(0.0, float(getattr(opts, "espera_reintento", 2.0) or 0.0))
+
     peticion = urllib.request.Request(
         url,
         headers={
             "User-Agent": opts.user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Upgrade-Insecure-Requests": "1",
         },
     )
 
     captura = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        with urllib.request.urlopen(peticion, timeout=opts.timeout,
-                                    context=_contexto_ssl(opts.verificar_tls)) as r:
-            # El limite es una salvaguarda, no una optimizacion: sin el, una URL
-            # que sirve un flujo infinito colgaria la conversion por lotes entera.
-            crudo = r.read(opts.max_bytes + 1)
-            if len(crudo) > opts.max_bytes:
-                crudo = crudo[:opts.max_bytes]
-            content_type = r.headers.get("Content-Type", "")
-            estado = getattr(r, "status", 0) or r.getcode() or 0
-            url_final = r.geturl()
-    except urllib.error.HTTPError as ex:
-        raise ErrorDeDescarga(f"El servidor respondio {ex.code} ({ex.reason}) para {url}") from ex
-    except urllib.error.URLError as ex:
-        raise ErrorDeDescarga(f"No se pudo conectar con {url}: {ex.reason}") from ex
-    except (ssl.SSLError, OSError, ValueError) as ex:
-        raise ErrorDeDescarga(f"Fallo de red al pedir {url}: {ex}") from ex
+    ultimo_error: Optional[Exception] = None
+
+    for intento in range(1, intentos_max + 1):
+        try:
+            with urllib.request.urlopen(peticion, timeout=opts.timeout,
+                                        context=_contexto_ssl(opts.verificar_tls)) as r:
+                # El limite es una salvaguarda, no una optimizacion: sin el, una URL
+                # que sirve un flujo infinito colgaria la conversion por lotes entera.
+                crudo = r.read(opts.max_bytes + 1)
+                if len(crudo) > opts.max_bytes:
+                    crudo = crudo[:opts.max_bytes]
+                content_type = r.headers.get("Content-Type", "")
+                estado = getattr(r, "status", 0) or r.getcode() or 0
+                url_final = r.geturl()
+            break
+        except Exception as ex:
+            ultimo_error = ex
+            if intento < intentos_max and _es_error_transitorio(ex):
+                if espera_base > 0:
+                    time.sleep(espera_base * intento)
+                continue
+            if isinstance(ex, urllib.error.HTTPError):
+                raise ErrorDeDescarga(f"El servidor respondio {ex.code} ({ex.reason}) para {url}") from ex
+            if isinstance(ex, urllib.error.URLError):
+                raise ErrorDeDescarga(f"No se pudo conectar con {url}: {ex.reason}") from ex
+            if isinstance(ex, (ssl.SSLError, OSError, ValueError)):
+                raise ErrorDeDescarga(f"Fallo de red al pedir {url}: {ex}") from ex
+            raise
+    else:
+        raise ErrorDeDescarga(f"Fallo de red tras {intentos_max} intentos para {url}: {ultimo_error}")
 
     texto, encoding = decodificar(crudo, content_type)
     return Respuesta(
@@ -164,16 +203,20 @@ def leer_fichero(ruta: str, url_origen: str = "") -> Respuesta:
     except OSError:
         mtime = ""
 
+    url_efectiva = (url_origen or "").strip() or leer_url_origen(ruta)
+
+    # Sin URL declarada no se inventa una: la ruta va en ruta_local, no como URL
     return Respuesta(
         html=texto,
         crudo=crudo,
-        url_solicitada=url_origen or ruta,
-        url_final=url_origen,
+        url_solicitada=url_efectiva,
+        url_final=url_efectiva,
         estado_http=0,
         content_type="text/html (fichero local)",
         encoding=encoding,
         sha256=hashlib.sha256(crudo).hexdigest(),
-        fecha_captura=mtime,
+        ruta_local=os.path.abspath(ruta),
+        fecha_archivo=mtime,
     )
 
 

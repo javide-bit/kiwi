@@ -17,6 +17,9 @@ SUITES = [
     ("Mejoras de conversión", "test_mejoras", "run_all"),
     ("Web a Markdown (htmlmd)", "test_htmlmd", "run_all"),
     ("Integración del conversor web", "test_integracion_web", "run_all"),
+    ("Modo visualmente limpio", "test_modo_limpio", "run_all"),
+    ("Nuevas 6 mejoras (v2)", "test_mejoras_v2", "run_all"),
+    ("Conversión de corpus y lotes", "test_corpus", "run_all"),
 ]
 
 

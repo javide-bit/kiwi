@@ -9,6 +9,7 @@ htmlmd.pipeline — Orquestador de la conversion de pagina web a Markdown.
 
 import hashlib
 import os
+import re
 import ssl
 import urllib.error
 import urllib.request
@@ -16,7 +17,7 @@ from typing import Callable, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from htmlmd.extract import extraer
-from htmlmd.fetch import ErrorDeDescarga, Respuesta, obtener
+from htmlmd.fetch import ErrorDeDescarga, Respuesta, es_url, obtener
 from htmlmd.models import WebMetadata, WebOptions
 from htmlmd.render import render_web, ruta_de_assets
 from pdfmd.utils import slugify
@@ -29,6 +30,54 @@ _EXTENSIONES = {
     "image/gif": "gif", "image/webp": "webp", "image/avif": "avif",
     "image/svg+xml": "svg", "image/bmp": "bmp", "image/tiff": "tiff",
 }
+
+_RE_CHARS_FM = re.compile(r"^chars_extraidos:\s*(\d+)\s*$", re.MULTILINE)
+
+
+def _chars_de_md_existente(ruta_md: str) -> int:
+    """Devuelve los caracteres extraídos de un .md ya existente en disco."""
+    if not ruta_md or not os.path.isfile(ruta_md):
+        return 0
+    try:
+        with open(ruta_md, "r", encoding="utf-8", errors="replace") as f:
+            texto = f.read()
+    except OSError:
+        return 0
+    if not texto.strip():
+        return 0
+    m = _RE_CHARS_FM.search(texto[:4096])
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    if texto.startswith("---"):
+        cierre = texto.find("\n---", 3)
+        if cierre != -1:
+            texto = texto[cierre + 4:]
+    return len(texto.strip())
+
+
+def _buscar_html_local_alternativo(origen: str, output_md: str) -> str:
+    """
+    Si una descarga remota sale escasa, comprueba si existe un .html guardado
+    con el mismo nombre base en la carpeta de salida o en su carpeta padre.
+    """
+    if not es_url(origen) or not output_md:
+        return ""
+    out_abs = os.path.abspath(output_md)
+    out_dir = os.path.dirname(out_abs)
+    base = os.path.splitext(os.path.basename(out_abs))[0]
+    parent_dir = os.path.dirname(out_dir)
+    carpetas = [out_dir, parent_dir, os.path.join(parent_dir, "html")]
+    for d in carpetas:
+        if not d or not os.path.isdir(d):
+            continue
+        for ext in (".html", ".htm"):
+            cand = os.path.join(d, base + ext)
+            if os.path.isfile(cand):
+                return cand
+    return ""
 
 
 class _DescargadorDeImagenes:
@@ -132,6 +181,10 @@ def convertir_respuesta(respuesta: Respuesta, output_md: str,
     paginas, metadatos = extraer(respuesta, opts, guardar_imagen=descargador)
     if opts.seccion and not metadatos.seccion:
         metadatos.seccion = opts.seccion
+    if metadatos.chars_extraidos < opts.min_chars_contenido and not respuesta.ruta_local:
+        alt_local = _buscar_html_local_alternativo(respuesta.url_solicitada or respuesta.url_final, output_md)
+        if alt_local:
+            metadatos.alternativa_local = alt_local
     clasificar_contenido(metadatos, opts)
 
     if log_cb:
@@ -139,7 +192,9 @@ def convertir_respuesta(respuesta: Respuesta, output_md: str,
                f"{metadatos.bloques} bloques, {metadatos.chars_extraidos} caracteres, "
                f"{metadatos.enlaces} enlaces.")
         if metadatos.contenido != "completo":
-            log_cb(f"AVISO: contenido {metadatos.contenido}. Revisar contra el original.")
+            detalle_motivo = f" ({metadatos.motivo_escaso})" if metadatos.motivo_escaso else ""
+            alt_msg = f" Alternativa local: {metadatos.alternativa_local}" if metadatos.alternativa_local else ""
+            log_cb(f"AVISO: contenido {metadatos.contenido}{detalle_motivo}.{alt_msg} Revisar contra el original.")
         if descargador and descargador.reutilizadas:
             log_cb("Imagenes repetidas reutilizadas sin duplicar fichero: "
                    f"{descargador.reutilizadas}")
@@ -161,22 +216,91 @@ def html_to_markdown(origen: str, output_md: str,
     un fichero vacio en silencio.
     """
     opts = options or WebOptions()
+    ruta_baja = origen.lower().split("?")[0]
+    if any(ruta_baja.endswith(ext) for ext in (".csv", ".zip", ".tar", ".gz", ".exe", ".xlsx", ".docx")):
+        raise ErrorDeDescarga(f"{origen}: tipo de archivo binario no soportado para conversión a Markdown.")
+
     if log_cb:
         log_cb(f"Obteniendo: {origen}")
 
     respuesta = obtener(origen, opts, url_origen=url_origen)
 
     tipo = (respuesta.content_type or "").lower()
+    es_pdf = (
+        ruta_baja.endswith(".pdf")
+        or "pdf" in tipo
+        or respuesta.crudo.startswith(b"%PDF")
+    )
+    if es_pdf:
+        import tempfile
+        from pdfmd.models import Options as PdfmdOptions
+        from pdfmd.pipeline import pdf_to_markdown
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_f:
+            tmp_pdf = tmp_f.name
+            tmp_f.write(respuesta.crudo)
+        try:
+            pdf_opts = PdfmdOptions(
+                clean_mode=opts.clean_mode if hasattr(opts, "clean_mode") else False,
+                export_images=opts.exportar_imagenes,
+                join_hyphens=True,
+                normalize_lists=opts.normalizar_listas,
+            )
+            markdown = pdf_to_markdown(
+                tmp_pdf, output_md, options=pdf_opts,
+                url_origen=url_origen or origen
+            )
+        finally:
+            try:
+                os.remove(tmp_pdf)
+            except OSError:
+                pass
+
+        metadatos = WebMetadata(
+            url_solicitada=url_origen or origen,
+            url_final=respuesta.url_final or origen,
+            titulo=os.path.splitext(os.path.basename(output_md))[0],
+            chars_extraidos=len(markdown),
+            contenido="completo",
+            criterio_cuerpo="pdfmd",
+            bloques=markdown.count("\n\n"),
+            fecha_captura=respuesta.fecha_captura
+        )
+        if escribir:
+            destino = os.path.abspath(output_md)
+            os.makedirs(os.path.dirname(destino) or ".", exist_ok=True)
+            with open(destino, "w", encoding="utf-8", newline="\n") as f:
+                f.write(markdown)
+            if log_cb:
+                log_cb(f"Escrito (PDF convertido con pdfmd): {destino}")
+
+        return markdown, metadatos
+
     if tipo and "html" not in tipo and "xml" not in tipo and "text/plain" not in tipo:
         raise ErrorDeDescarga(
-            f"{origen} no devolvio HTML sino {tipo!r}. "
-            "Para un PDF usa el conversor pdfmd de KIWI."
+            f"{origen} no devolvio HTML ni PDF sino {tipo!r}."
         )
 
     markdown, metadatos = convertir_respuesta(respuesta, output_md, opts, log_cb)
 
     if escribir:
         destino = os.path.abspath(output_md)
+        if (
+            getattr(opts, "proteger_salida_existente", True)
+            and metadatos.contenido in ("escaso", "ausente")
+            and os.path.isfile(destino)
+        ):
+            chars_prev = _chars_de_md_existente(destino)
+            if chars_prev > metadatos.chars_extraidos:
+                msg_prot = (
+                    f"no se sobrescribió la salida anterior más larga "
+                    f"({chars_prev} chars frente a {metadatos.chars_extraidos})"
+                )
+                if msg_prot not in metadatos.avisos:
+                    metadatos.avisos.append(msg_prot)
+                if log_cb:
+                    log_cb(f"AVISO: {msg_prot} en {destino}")
+                return markdown, metadatos
+
         os.makedirs(os.path.dirname(destino) or ".", exist_ok=True)
         with open(destino, "w", encoding="utf-8", newline="\n") as f:
             f.write(markdown)

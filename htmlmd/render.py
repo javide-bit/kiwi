@@ -25,10 +25,43 @@ AVISO_CONTENIDO_ESCASO = (
 )
 
 
-def generar_frontmatter(metadata: Optional[WebMetadata]) -> str:
+def _construir_aviso_escaso(metadata: WebMetadata) -> str:
+    base = AVISO_CONTENIDO_ESCASO
+    detalles = []
+    if getattr(metadata, "motivo_escaso", ""):
+        detalles.append(f"**Motivo detectado:** {metadata.motivo_escaso}.")
+    if getattr(metadata, "alternativa_local", ""):
+        detalles.append(f"**Alternativa local disponible:** `{metadata.alternativa_local}`.")
+    if detalles:
+        return base + "\n> " + " ".join(detalles)
+    return base
+
+
+def generar_frontmatter(metadata: Optional[WebMetadata],
+                        opts: Optional[WebOptions] = None) -> str:
     """Bloque YAML con la procedencia y el diagnostico de la captura."""
     if metadata is None:
         return ""
+
+    if opts and opts.clean_mode:
+        lineas = ["---", f"title: {yaml_quote(metadata.titulo or 'Sin titulo')}"]
+        for etiqueta, valor in (
+            ("author", metadata.autor),
+            ("description", metadata.descripcion),
+            ("keywords", metadata.keywords),
+            ("sitio", metadata.sitio),
+            ("date", metadata.fecha_publicacion),
+            ("seccion", metadata.seccion),
+        ):
+            if valor:
+                lineas.append(f"{etiqueta}: {yaml_quote(valor)}")
+        if metadata.url_final:
+            lineas.append(f"url_origen: {yaml_quote(metadata.url_final)}")
+        # La huella permite emparejar el .md con su HTML tambien en modo limpio
+        if metadata.sha256_html:
+            lineas.append(f"sha256: {yaml_quote(metadata.sha256_html)}")
+        lineas.append("---\n")
+        return "\n".join(lineas)
 
     lineas = ["---", f"title: {yaml_quote(metadata.titulo or 'Sin titulo')}"]
 
@@ -50,18 +83,26 @@ def generar_frontmatter(metadata: Optional[WebMetadata]) -> str:
                   if metadata.url_final else "url_origen: null")
     if metadata.url_solicitada and metadata.url_solicitada != metadata.url_final:
         lineas.append(f"url_solicitada: {yaml_quote(metadata.url_solicitada)}")
+    if metadata.ruta_local:
+        lineas.append(f"source_file: {yaml_quote(os.path.basename(metadata.ruta_local))}")
+        lineas.append(f"ruta_origen: {yaml_quote(metadata.ruta_local)}")
     if metadata.estado_http:
         lineas.append(f"estado_http: {metadata.estado_http}")
     if metadata.fecha_publicacion:
         lineas.append(f"fecha_publicacion: {yaml_quote(metadata.fecha_publicacion)}")
     if metadata.fecha_captura:
         lineas.append(f"fecha_captura: {yaml_quote(metadata.fecha_captura)}")
+    if metadata.fecha_archivo:
+        lineas.append(f"fecha_archivo: {yaml_quote(metadata.fecha_archivo)}")
     if metadata.fecha_conversion:
         lineas.append(f"fecha_conversion: {yaml_quote(metadata.fecha_conversion)}")
     # Huella del HTML tal y como vino por el cable: es lo que permite demostrar
     # dentro de anos que este .md corresponde a aquella captura y no a otra.
     lineas.append(f"sha256_html: {yaml_quote(metadata.sha256_html)}"
                   if metadata.sha256_html else "sha256_html: null")
+    # Mismo valor con el nombre neutro que leen los importadores (sha256_pdf o sha256)
+    if metadata.sha256_html:
+        lineas.append(f"sha256: {yaml_quote(metadata.sha256_html)}")
 
     # Diagnostico: permite decidir de que ficheros fiarse sin volver a abrir la web
     lineas.append(f"chars_extraidos: {metadata.chars_extraidos}")
@@ -70,6 +111,10 @@ def generar_frontmatter(metadata: Optional[WebMetadata]) -> str:
     lineas.append(f"imagenes: {metadata.imagenes}")
     lineas.append(f"contenido: {yaml_quote(metadata.contenido)}")
     lineas.append(f"criterio_cuerpo: {yaml_quote(metadata.criterio_cuerpo)}")
+    if getattr(metadata, "motivo_escaso", ""):
+        lineas.append(f"motivo_escaso: {yaml_quote(metadata.motivo_escaso)}")
+    if getattr(metadata, "alternativa_local", ""):
+        lineas.append(f"alternativa_local: {yaml_quote(metadata.alternativa_local)}")
     if metadata.elementos_suprimidos:
         lineas.append(f"elementos_suprimidos: {yaml_lista(metadata.elementos_suprimidos)}")
     if metadata.avisos:
@@ -96,10 +141,15 @@ def clasificar_contenido(metadata: WebMetadata, opts: WebOptions) -> None:
         metadata.contenido = "completo"
 
     if metadata.contenido != "completo":
-        aviso = (f"contenido {metadata.contenido}: "
-                 f"{metadata.chars_extraidos} caracteres extraidos")
-        if aviso not in metadata.avisos:
-            metadata.avisos.append(aviso)
+        partes_aviso = [f"contenido {metadata.contenido}: {metadata.chars_extraidos} caracteres extraidos"]
+        if getattr(metadata, "motivo_escaso", ""):
+            partes_aviso.append(f"motivo: {metadata.motivo_escaso}")
+        if getattr(metadata, "alternativa_local", ""):
+            partes_aviso.append(f"alternativa local: {metadata.alternativa_local}")
+        aviso = " (" + "; ".join(partes_aviso[1:]) + ")" if len(partes_aviso) > 1 else ""
+        texto_aviso = partes_aviso[0] + aviso
+        if texto_aviso not in metadata.avisos:
+            metadata.avisos.append(texto_aviso)
 
 
 def render_web(pages: List[PageText], output_md_path: str, opts: WebOptions,
@@ -114,15 +164,16 @@ def render_web(pages: List[PageText], output_md_path: str, opts: WebOptions,
         log_cb=log_cb,
     ).strip()
 
-    if (metadata is not None and opts.avisar_contenido_escaso
+    if (metadata is not None and opts.avisar_contenido_escaso and not opts.clean_mode
             and metadata.contenido != "completo"):
         # Delante del todo: el frontmatter se lee si se busca, esto se ve al abrir
-        cuerpo = f"{AVISO_CONTENIDO_ESCASO}\n\n{cuerpo}".strip()
+        aviso_bloque = _construir_aviso_escaso(metadata)
+        cuerpo = f"{aviso_bloque}\n\n{cuerpo}".strip()
 
     if not opts.incluir_frontmatter:
         return cuerpo + "\n"
 
-    fm = generar_frontmatter(metadata)
+    fm = generar_frontmatter(metadata, opts=opts)
     return f"{fm}\n\n{cuerpo}\n" if fm else cuerpo + "\n"
 
 

@@ -20,11 +20,18 @@ Enlace = Tuple[Tuple[float, float, float, float], str, str]
 from pdfmd.utils import (
     detectar_idioma,
     fecha_de_fichero,
+    fecha_pdf_iso,
     find_ocrmypdf_binary,
     find_tesseract_binary,
+    inferir_idioma_ocr_documento,
+    is_ocrmypdf_available,
     is_tesseract_available,
     leer_url_origen,
+    normalizar_texto_pdf,
+    preparar_entorno_ocr,
+    resolver_idioma_ocr,
     sha256_fichero,
+    version_motor_ocr,
 )
 
 
@@ -37,20 +44,28 @@ def extract_document_metadata(doc: fitz.Document, filename: str,
     def _clean(key: str) -> str:
         return (meta.get(key) or "").strip()
 
+    try:
+        toc = doc.get_toc() or []
+    except Exception:
+        toc = []
+
     return DocumentMetadata(
         title=_clean("title"),
         author=_clean("author"),
         subject=_clean("subject"),
         keywords=_clean("keywords"),
         creator=_clean("creator"),
-        creation_date=_clean("creationDate"),
-        mod_date=_clean("modDate"),
+        creation_date=fecha_pdf_iso(_clean("creationDate")),
+        mod_date=fecha_pdf_iso(_clean("modDate")),
         page_count=len(doc),
         filename=os.path.basename(filename),
         url_origen=opts.url_origen or leer_url_origen(filename),
-        fecha_captura=opts.fecha_captura or fecha_de_fichero(filename),
+        fecha_captura=opts.fecha_captura,
+        fecha_archivo=fecha_de_fichero(filename),
+        ocr_modo=opts.ocr_mode,
         fecha_conversion=datetime.now().strftime("%Y-%m-%d"),
-        sha256_pdf=sha256_fichero(filename) if opts.compute_hash else ""
+        sha256_pdf=sha256_fichero(filename) if opts.compute_hash else "",
+        outline=[(int(x[0]), str(x[1]), int(x[2])) for x in toc if len(x) >= 3],
     )
 
 
@@ -62,9 +77,11 @@ def should_apply_ocr(page: fitz.Page, options: Options) -> bool:
     if options.ocr_mode == "tesseract":
         return True
 
-    text = page.get_text("text")
-    if len(text.strip()) < 50:
-        return True
+    # "auto" (por defecto) hace OCR en paginas que parecen escaneadas o diapositivas
+    # con imagen de pagina completa y poco texto nativo.
+    text = page.get_text("text").strip()
+    if len(text) >= 340:
+        return False
 
     img_area = 0.0
     page_rect = page.rect
@@ -76,71 +93,148 @@ def should_apply_ocr(page: fitz.Page, options: Options) -> bool:
                 img_area += r.width * r.height
         except Exception:
             pass
-    if (img_area / total_area) > 0.30:
+    ratio = img_area / total_area
+    if len(text) < 100 and ratio > 0.20:
+        return True
+    if len(text) < 200 and ratio > 0.30:
+        return True
+    if len(text) < 340 and ratio > 0.95:
         return True
     return False
 
 
+# ocrmypdf ya reparte cada documento entre todos los nucleos: varios a la vez
+# (lote con varios hilos) solo multiplican memoria y procesos. Uno cada vez.
+_OCRMYPDF_LOCK = threading.Lock()
+
+
+def _necesita_force_ocr(input_pdf: str) -> bool:
+    """
+    True si el PDF carece de texto sustancial en la mayoría de sus páginas (p. ej.
+    solo lleva un sello 'Downloaded by...' de <200 chars sobre páginas escaneadas).
+    Si ya tiene >=25 % de páginas con >=250 chars de texto nativo, '--skip-text'
+    conserva ese texto y solo hace OCR en las páginas vacías/escaneadas.
+    """
+    try:
+        with fitz.open(input_pdf) as doc:
+            if doc.is_encrypted or len(doc) == 0:
+                return True
+            con_texto_real = sum(1 for p in doc if len(p.get_text("text").strip()) >= 250)
+            return con_texto_real * 4 < len(doc)
+    except Exception:
+        return True
+
+
 def run_ocrmypdf(input_pdf: str, lang: str = "eng",
-                 log_cb: Optional[Callable[[str], None]] = None) -> Optional[str]:
+                 log_cb: Optional[Callable[[str], None]] = None,
+                 forzar: bool = False,
+                 avisos_out: Optional[List[str]] = None) -> Optional[str]:
     """
     Ejecuta ocrmypdf sobre el documento completo generando una copia temporal con
     capa de texto. Devuelve la ruta del PDF procesado o None si no fue posible.
     El llamante es responsable de eliminar el directorio temporal resultante.
     """
+    preparar_entorno_ocr()
     binary = find_ocrmypdf_binary()
     if not binary:
+        msg = "ocrmypdf no está instalado en el sistema: se continúa sin OCR."
         if log_cb:
-            log_cb("ocrmypdf no está instalado en el sistema: se continúa sin OCR.")
+            log_cb(msg)
+        if avisos_out is not None:
+            avisos_out.append(msg)
         return None
 
     tmp_dir = tempfile.mkdtemp(prefix="pdfmd_ocr_")
     out_pdf = os.path.join(tmp_dir, "ocr_" + os.path.basename(input_pdf))
-    cmd = [binary, "--skip-text", "--quiet", "-l", lang, input_pdf, out_pdf]
+    # --force-ocr rehace todas las paginas cuando apenas hay texto nativo (ej. sello
+    # "Downloaded by..."); si el documento ya tiene muchas paginas con texto real,
+    # --skip-text evita rasterizar lo que ya estaba bien extraido.
+    usar_force = forzar and _necesita_force_ocr(input_pdf)
+    modo = "--force-ocr" if usar_force else "--skip-text"
+    idioma_efectivo = inferir_idioma_ocr_documento(input_pdf, base_lang=lang)
+    jobs = str(min(4, max(1, os.cpu_count() or 2)))
+    cmd = [binary, modo, "--jobs", jobs, "--quiet", "-l", idioma_efectivo, input_pdf, out_pdf]
 
     if log_cb:
-        log_cb("Aplicando OCR con ocrmypdf sobre el documento completo...")
+        log_cb(f"Aplicando OCR con ocrmypdf ({modo}, -l {idioma_efectivo}) sobre el documento completo...")
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=1800)
+        with _OCRMYPDF_LOCK:
+            proc = subprocess.run(cmd, capture_output=True, timeout=3600,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if proc.returncode == 0 and os.path.exists(out_pdf):
             return out_pdf
+        # Codigo 6 en ocrmypdf significa que ya habia texto; si no se creo out_pdf, copiar o reintentar con --skip-text
+        if proc.returncode == 6 and os.path.exists(out_pdf):
+            return out_pdf
         detalle = (proc.stderr or b"").decode("utf-8", "replace").strip()[:300]
+        msg_err = f"ocrmypdf devolvió un error ({proc.returncode}): {detalle}"
         if log_cb:
-            log_cb(f"ocrmypdf devolvió un error ({proc.returncode}): {detalle}")
+            log_cb(msg_err)
+        if avisos_out is not None:
+            avisos_out.append(msg_err)
     except subprocess.TimeoutExpired:
+        msg_timeout = "ocrmypdf superó el tiempo máximo de espera: se continúa sin OCR."
         if log_cb:
-            log_cb("ocrmypdf superó el tiempo máximo de espera: se continúa sin OCR.")
+            log_cb(msg_timeout)
+        if avisos_out is not None:
+            avisos_out.append(msg_timeout)
     except Exception as ex:
+        msg_ex = f"No se pudo ejecutar ocrmypdf: {ex}"
         if log_cb:
-            log_cb(f"No se pudo ejecutar ocrmypdf: {ex}")
+            log_cb(msg_ex)
+        if avisos_out is not None:
+            avisos_out.append(msg_ex)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return None
 
 
 def run_tesseract_on_page(page: fitz.Page, lang: str = "eng") -> Optional[PageText]:
-    """Ejecuta OCR sobre el pixmap de una página con pytesseract si está disponible."""
+    """Ejecuta OCR sobre el pixmap de una página invocando directamente el binario tesseract."""
     try:
-        import pytesseract
-        from PIL import Image
-        import io
-        pix = page.get_pixmap(dpi=200)
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        preparar_entorno_ocr()
         tess_bin = find_tesseract_binary()
-        if tess_bin:
-            pytesseract.pytesseract.tesseract_cmd = tess_bin
-        data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DICT)
+        if not tess_bin:
+            return None
 
+        dpi = 200
+        escala = 72.0 / float(dpi)
+        pix = page.get_pixmap(dpi=dpi)
+        png_bytes = pix.tobytes("png")
+        idioma = resolver_idioma_ocr(lang)
+
+        proc = subprocess.run(
+            [tess_bin, "stdin", "stdout", "-l", idioma, "tsv"],
+            input=png_bytes,
+            capture_output=True,
+            timeout=120,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+
+        salida = proc.stdout.decode("utf-8", "replace").splitlines()
         blocks_map = {}
-        for i in range(len(data["text"])):
-            txt = data["text"][i].strip()
+        for idx_linea, fila in enumerate(salida):
+            if idx_linea == 0 or not fila.strip():
+                continue
+            partes = fila.split("\t")
+            if len(partes) < 12:
+                continue
+            txt = normalizar_texto_pdf(partes[11].strip())
             if not txt:
                 continue
-            b_num = data["block_num"][i]
-            l_num = data["line_num"][i]
-            x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-            span = Span(text=txt + " ", size=float(h), bbox=(x, y, x + w, y + h))
+            try:
+                b_num = (int(partes[2]), int(partes[3]))
+                l_num = int(partes[4])
+                x = float(partes[6]) * escala
+                y = float(partes[7]) * escala
+                w = float(partes[8]) * escala
+                h = float(partes[9]) * escala
+            except ValueError:
+                continue
 
+            span = Span(text=txt + " ", size=max(6.0, round(h * 0.85, 1)), bbox=(x, y, x + w, y + h))
             if b_num not in blocks_map:
                 blocks_map[b_num] = {}
             if l_num not in blocks_map[b_num]:
@@ -169,7 +263,8 @@ def run_tesseract_on_page(page: fitz.Page, lang: str = "eng") -> Optional[PageTe
             width=page.rect.width,
             height=page.rect.height,
             char_count=total_chars,
-            has_images=True
+            has_images=True,
+            ocr_aplicado=True,
         )
     except Exception:
         return None
@@ -180,7 +275,12 @@ def extract_native_tables(page: fitz.Page) -> List[Tuple[Tuple[float, float, flo
     tables_found = []
     if hasattr(page, "find_tables"):
         try:
-            tabs = page.find_tables()
+            # pymupdf 2.x con pymupdf_layout instalado pasa cada pagina por un
+            # modelo neuronal (~4 s/pagina); las tablas con lineas no lo necesitan.
+            try:
+                tabs = page.find_tables(use_layout=False)
+            except TypeError:
+                tabs = page.find_tables()
             for tab in tabs:
                 extracted = tab.extract()
                 if extracted and len(extracted) >= 2:
@@ -366,16 +466,47 @@ def diagnosticar_capa_texto(pages: List[PageText], metadata: DocumentMetadata,
     n_paginas = len(pages) or 1
     metadata.chars_extraidos = total_chars
     metadata.chars_por_pagina = int(round(total_chars / n_paginas))
+    paginas_con_texto = sorted(p.char_count for p in pages if p.char_count >= 50)
+    paginas_vacias = len(pages) - len(paginas_con_texto)
+    mediana_con_texto = (
+        paginas_con_texto[len(paginas_con_texto) // 2] if paginas_con_texto else 0
+    )
 
-    hubo_ocr = motor_ocr or any(p.ocr_aplicado for p in pages)
+    hubo_ocr = bool(motor_ocr) or any(p.ocr_aplicado for p in pages)
     if hubo_ocr:
         metadata.capa_texto = "ocr"
-        metadata.ocr_motor = motor_ocr or "tesseract"
+        metadata.ocr_motor = version_motor_ocr(motor_ocr or "tesseract")
     else:
         metadata.capa_texto = "nativa"
         metadata.ocr_motor = ""
 
-    if metadata.chars_por_pagina < options.min_chars_por_pagina:
+    # Detectar escaneados que solo traen un sello corto repetido (ej. JSTOR 103 chars/pag)
+    solo_sello_en_escaneo = (
+        not hubo_ocr
+        and len(pages) >= 5
+        and mediana_con_texto < 160
+        and sum(1 for p in pages if p.has_images and p.char_count < 160) >= int(len(pages) * 0.75)
+    )
+
+    # Si un documento largo tiene varias paginas con texto real (mediana alta), aunque
+    # tenga muchas paginas tachadas/vacias no es "ausente" sino "escasa".
+    tiene_paginas_sustanciales = (
+        len(paginas_con_texto) >= 4
+        and mediana_con_texto >= max(200, options.min_chars_por_pagina * 2)
+        and total_chars >= 1500
+    )
+
+    # "Ausente" es no tener texto (media casi nula o mayoria de paginas vacias sin
+    # cuerpo sustancial); una presentacion o un informe con graficos da poco texto
+    # por pagina pero real: eso es "escasa", y no dispara el aviso de sin capa.
+    if solo_sello_en_escaneo or (
+        not tiene_paginas_sustanciales
+        and (
+            metadata.chars_por_pagina < options.min_chars_por_pagina
+            or paginas_vacias * 2 > len(pages)
+            or mediana_con_texto < options.min_chars_por_pagina
+        )
+    ):
         # Aunque haya pasado el OCR: si tras el OCR sigue sin haber texto, lo que
         # el usuario tiene delante no es el documento.
         metadata.capa_texto = "ausente"
@@ -385,6 +516,11 @@ def diagnosticar_capa_texto(pages: List[PageText], metadata: DocumentMetadata,
             metadata.avisos.append(aviso)
         if log_cb:
             log_cb(f"AVISO: {aviso} Verificar el resultado contra el original.")
+    elif not hubo_ocr and (
+        metadata.chars_por_pagina < options.escasa_chars_por_pagina
+        or mediana_con_texto < options.escasa_chars_por_pagina
+    ):
+        metadata.capa_texto = "escasa"
 
     metadata.enlaces = sum(
         1 for p in pages for b in p.blocks for l in b.lines for sp in l.spans if sp.link
@@ -442,19 +578,115 @@ def extract_pages(
     progress_cb: Optional[Callable[[int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None
 ) -> Tuple[List[PageText], DocumentMetadata]:
-    """Extrae las páginas del PDF junto con metadatos estructurados y soporte de tablas nativas."""
+    """
+    Extrae las páginas del PDF. Si el documento sale sin capa de texto y hay
+    motor de OCR, reintenta con OCR y se queda con la extracción más completa.
+    """
     if not os.path.exists(input_pdf):
         raise FileNotFoundError(f"No se encontró el archivo PDF: {input_pdf}")
+    preparar_entorno_ocr()
 
+    # Documento mayoritariamente escaneado: ocrmypdf de una vez usa todos los
+    # nucleos; Tesseract pagina a pagina es secuencial (253 paginas, ~40 min).
+    if options.ocr_mode == "auto" and is_ocrmypdf_available() and _mayoria_escaneada(input_pdf, options):
+        if log_cb:
+            log_cb("Documento escaneado: OCR completo con ocrmypdf...")
+        pages, metadata = _extract_pages_once(input_pdf, replace(options, ocr_mode="ocrmypdf"),
+                                              pdf_password, log_cb, progress_cb, cancel_event,
+                                              forzar_ocr=True)
+        if metadata.capa_texto == "ocr":
+            metadata.ocr_modo = options.ocr_mode
+            return pages, metadata
+
+    pages, metadata = _extract_pages_once(input_pdf, options, pdf_password, log_cb,
+                                          progress_cb, cancel_event,
+                                          forzar_ocr=(options.ocr_mode == "ocrmypdf"))
+    if (options.ocr_mode == "off" or not options.detect_text_layer
+            or metadata.capa_texto != "ausente"):
+        return pages, metadata
+    # ponytail: sin imagenes no hay escaneo que leer; un PDF con el texto
+    # convertido en trazos (sin imagen) no se reintenta. Forzar ocrmypdf si aparece.
+    if not any(p.has_images for p in pages):
+        return pages, metadata
+
+    # Reintento: ocrmypdf forzado (todas las paginas, en paralelo) o, si no
+    # esta, Tesseract en todas las paginas cuando la primera pasada no lo uso.
+    if is_ocrmypdf_available():
+        reintento, forzar = replace(options, ocr_mode="ocrmypdf"), True
+    elif is_tesseract_available() and not all(p.ocr_aplicado for p in pages):
+        reintento, forzar = replace(options, ocr_mode="tesseract"), False
+    else:
+        if log_cb:
+            log_cb("Sin capa de texto y sin motor de OCR instalado: no se puede reintentar.")
+        return pages, metadata
+
+    if log_cb:
+        log_cb(f"Sin capa de texto: reintentando con OCR ({reintento.ocr_mode})...")
+    try:
+        pages2, metadata2 = _extract_pages_once(input_pdf, reintento, pdf_password, log_cb,
+                                                progress_cb, cancel_event, forzar_ocr=forzar)
+    except (InterruptedError, PermissionError):
+        raise
+    except Exception as ex:
+        if log_cb:
+            log_cb(f"El reintento con OCR falló: {ex}")
+        return pages, metadata
+    # Solo si el OCR aporta de verdad: rasterizar un PDF nativo escueto y
+    # volver a leerlo daria el mismo texto sin enlaces ni negritas.
+    if metadata2.chars_extraidos >= 2 * metadata.chars_extraidos + 100 or metadata2.capa_texto == "ocr":
+        metadata2.ocr_modo = options.ocr_mode
+        return pages2, metadata2
+    return pages, metadata
+
+
+def _mayoria_escaneada(input_pdf: str, options: Options) -> bool:
+    """True si al menos 3 paginas y mas de la mitad piden OCR (y no esta cifrado)."""
+    try:
+        with fitz.open(input_pdf) as doc:
+            if doc.is_encrypted or len(doc) < 3:
+                return False
+            escaneadas = sum(1 for page in doc if should_apply_ocr(page, options))
+            return escaneadas * 2 > len(doc)
+    except Exception:
+        return False
+
+
+def _bloques_desde_texto_plano(texto: str, page_num: int) -> List[Block]:
+    """Construye bloques de texto a partir de una extracción plana alternativa."""
+    bloques: List[Block] = []
+    parrafos = re.split(r"\n\s*\n", texto.strip()) if "re" in globals() else texto.strip().split("\n\n")
+    for p in parrafos:
+        lineas = [
+            Line(spans=[Span(text=normalizar_texto_pdf(l.strip()))])
+            for l in p.splitlines()
+            if l.strip()
+        ]
+        if lineas:
+            bloques.append(Block(lines=lineas, block_type="text", page_num=page_num))
+    return bloques
+
+
+def _extract_pages_once(
+    input_pdf: str,
+    options: Options,
+    pdf_password: Optional[str] = None,
+    log_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    forzar_ocr: bool = False
+) -> Tuple[List[PageText], DocumentMetadata]:
+    """Una pasada de extracción con metadatos estructurados y tablas nativas."""
     if options.ocr_mode in ("auto", "tesseract") and not is_tesseract_available():
         if log_cb:
             log_cb("Aviso: Tesseract no está disponible; el OCR se omitirá en las páginas escaneadas.")
 
+    avisos_ocr: List[str] = []
     # OCR previo del documento completo (modo ocrmypdf)
     ocr_tmp_pdf = None
     source_pdf = input_pdf
     if options.ocr_mode == "ocrmypdf":
-        ocr_tmp_pdf = run_ocrmypdf(input_pdf, lang=options.ocr_lang, log_cb=log_cb)
+        ocr_tmp_pdf = run_ocrmypdf(input_pdf, lang=options.ocr_lang, log_cb=log_cb,
+                                   forzar=forzar_ocr, avisos_out=avisos_ocr)
         if ocr_tmp_pdf:
             source_pdf = ocr_tmp_pdf
 
@@ -468,6 +700,14 @@ def extract_pages(
                 raise PermissionError("El PDF está protegido con contraseña.")
 
         metadata = extract_document_metadata(doc, input_pdf, options)
+        for av in avisos_ocr:
+            if av not in metadata.avisos:
+                metadata.avisos.append(av)
+        idioma_doc_ocr = inferir_idioma_ocr_documento(
+            input_pdf, base_lang=options.ocr_lang,
+            title=metadata.title, subject=metadata.subject
+        )
+
         total_pages = len(doc)
         max_pages = min(max(1, options.preview_pages), total_pages) if options.preview_only else total_pages
         pages_text: List[PageText] = []
@@ -483,14 +723,26 @@ def extract_pages(
 
             if should_apply_ocr(page, options):
                 if log_cb:
-                    log_cb(f"Aplicando OCR en página {page_num}...")
-                ocr_res = run_tesseract_on_page(page, lang=options.ocr_lang)
-                if ocr_res and ocr_res.blocks:
+                    log_cb(f"Aplicando OCR ({idioma_doc_ocr}) en página {page_num}...")
+                p_dict = page.get_text("dict")
+                nativa_pt = PageText.from_pymupdf_dict(p_dict, page_num=page_num)
+                ocr_res = run_tesseract_on_page(page, lang=idioma_doc_ocr)
+                if ocr_res and ocr_res.blocks and (
+                    ocr_res.char_count >= nativa_pt.char_count or options.ocr_mode == "tesseract"
+                ):
                     ocr_res.ocr_aplicado = True
                     pages_text.append(ocr_res)
                 else:
-                    p_dict = page.get_text("dict")
-                    pages_text.append(PageText.from_pymupdf_dict(p_dict, page_num=page_num))
+                    # Si la capa nativa de esa pagina tenia mas texto que el OCR, conservarla
+                    # sin perder la marca de que se paso el OCR en la pagina con imagen.
+                    if ocr_res is not None:
+                        nativa_pt.ocr_aplicado = True
+                    if options.extract_links:
+                        enlaces = extraer_enlaces(page)
+                        if enlaces:
+                            aplicar_enlaces(nativa_pt, enlaces)
+                            nativa_pt.enlaces_huerfanos = enlaces_sin_ancla(nativa_pt, enlaces)
+                    pages_text.append(nativa_pt)
             else:
                 # 1. Extracción de tablas nativas si la opción está activa
                 native_tables = extract_native_tables(page) if options.detect_tables else []
@@ -498,6 +750,15 @@ def extract_pages(
 
                 p_dict = page.get_text("dict")
                 page_text = PageText.from_pymupdf_dict(p_dict, page_num=page_num)
+
+                # Comparación con extracción alternativa (get_text("text")) si la capa dict pierde texto
+                if page_text.char_count < options.escasa_chars_por_pagina and not native_tables:
+                    alt_txt = normalizar_texto_pdf(page.get_text("text") or "").strip()
+                    if len(alt_txt) > page_text.char_count * 1.35 + 80:
+                        bloques_alt = _bloques_desde_texto_plano(alt_txt, page_num)
+                        if bloques_alt:
+                            page_text.blocks = bloques_alt
+                            page_text.char_count = len(alt_txt)
 
                 # 2. Descartar imágenes irrelevantes o no solicitadas
                 page_text.blocks = [

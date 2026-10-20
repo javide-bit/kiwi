@@ -39,6 +39,12 @@ TRANSPARENTES = {
 _RE_ESPACIOS = re.compile(r"\s+")
 _RE_ENLACE_MD = re.compile(r"\]\(|<https?://")
 _RE_LENGUAJE = re.compile(r"(?:language|lang|highlight)[-_]([A-Za-z0-9+#]+)", re.IGNORECASE)
+_RE_SAVED_FROM_URL = re.compile(
+    r"saved from url=(?:\(\d+\))?\s*(https?://[^\s>\"'\-]+)", re.IGNORECASE
+)
+_RE_SAVEPAGE_URL = re.compile(
+    r'(?:data-)?savepage-url\s*=\s*["\'](https?://[^"\']+)["\']', re.IGNORECASE
+)
 
 
 class _Estilo:
@@ -493,6 +499,101 @@ def _limpiar_titulo(titulo: str, sitio: str, dominio_web: str) -> str:
     return titulo
 
 
+def _extraer_url_guardada(raiz: Nodo, html_crudo: str, metas: dict, ld: dict, base_url: str) -> str:
+    """
+    Recupera la URL original de un HTML guardado o descargado buscando por orden:
+    1) <link rel="canonical" href="...">
+    2) <meta property="og:url"> / <meta name="twitter:url">
+    3) Comentario <!-- saved from url=(...)https://... --> o atributo savepage-url
+    4) JSON-LD url / mainEntityOfPage
+    """
+    for enlace in raiz.buscar("link"):
+        if "canonical" in enlace.attr("rel").lower():
+            href = (enlace.attr("href") or "").strip()
+            if href:
+                resuelta = resolver_url(base_url, href)
+                if resuelta.startswith(("http://", "https://")):
+                    return resuelta
+
+    for k in ("og:url", "twitter:url"):
+        val = (metas.get(k) or "").strip()
+        if val:
+            resuelta = resolver_url(base_url, val)
+            if resuelta.startswith(("http://", "https://")):
+                return resuelta
+
+    cabecera_html = (html_crudo or "")[:24576]
+    m_saved = _RE_SAVED_FROM_URL.search(cabecera_html)
+    if m_saved:
+        return m_saved.group(1).strip()
+
+    m_sp = _RE_SAVEPAGE_URL.search(cabecera_html)
+    if m_sp:
+        return m_sp.group(1).strip()
+
+    if isinstance(ld, dict):
+        ld_url = str(ld.get("url") or "").strip()
+        if ld_url.startswith(("http://", "https://")):
+            return ld_url
+        meop = ld.get("mainEntityOfPage")
+        if isinstance(meop, dict):
+            meop_id = str(meop.get("@id") or meop.get("url") or "").strip()
+            if meop_id.startswith(("http://", "https://")):
+                return meop_id
+        elif isinstance(meop, str) and meop.startswith(("http://", "https://")):
+            return meop
+
+    return ""
+
+
+def detectar_motivo_escaso(raiz: Nodo, html_crudo: str) -> str:
+    """
+    Identifica la causa probable cuando una página web produce contenido escaso
+    (cookie wall, login/paywall, bloqueo anti-bot o SPA con JavaScript).
+    """
+    muestra = (html_crudo or "")[:65536].lower()
+    texto_visible = raiz.texto_plano().lower()
+
+    # 1. Bloqueo anti-bot / Cloudflare / Captcha
+    patrones_bot = (
+        "just a moment...", "attention required! | cloudflare", "cf-browser-verification",
+        "enable javascript and cookies to continue", "verify you are human",
+        "checking your browser before accessing", "access denied", "captcha",
+    )
+    if any(p in muestra for p in patrones_bot):
+        return "bloqueo anti-bot / captcha"
+
+    # 2. Muro de cookies (cookie wall)
+    patrones_cookies = (
+        "cookiebot", "onetrust", "didomi", "quantcast", "trustarc",
+        "accept all cookies", "aceptar todas las cookies", "cookie consent",
+        "consentimiento de cookies", "manage cookie preferences", "we value your privacy",
+    )
+    if any(p in muestra or p in texto_visible for p in patrones_cookies):
+        return "cookie wall (aviso de consentimiento de cookies)"
+
+    # 3. Login / Muro de pago (paywall)
+    patrones_login = (
+        "paywall", "subscribe to read", "subscribe to continue", "sign in to continue",
+        "log in to view", "iniciar sesión", "inicia sesión para seguir leyendo",
+        "suscríbete para seguir leyendo", "contenido exclusivo para suscriptores",
+    )
+    if any(p in muestra or p in texto_visible for p in patrones_login):
+        return "login / muro de pago (paywall)"
+
+    # 4. Aplicación JavaScript (SPA) o noscript
+    num_scripts = len(raiz.buscar("script"))
+    tiene_noscript = bool(raiz.buscar("noscript"))
+    patrones_spa = (
+        'id="root"', 'id="app"', 'id="__next"', "you need to enable javascript",
+        "javascript is required", "please enable javascript", "requires javascript",
+    )
+    if any(p in muestra for p in patrones_spa) or (num_scripts >= 5 and tiene_noscript):
+        return "JavaScript requerido (renderizado en cliente / SPA)"
+
+    return ""
+
+
 def extraer_metadatos(raiz: Nodo, respuesta: Respuesta, opts: WebOptions) -> WebMetadata:
     metas = _metas(raiz)
     ld = _json_ld(raiz)
@@ -518,23 +619,20 @@ def extraer_metadatos(raiz: Nodo, respuesta: Respuesta, opts: WebOptions) -> Web
     idioma = html_tag.attr("lang").split("-")[0].lower() if html_tag else ""
 
     url_final = respuesta.url_final or respuesta.url_solicitada
-    canonica = ""
-    for enlace in raiz.buscar("link"):
-        if "canonical" in enlace.attr("rel").lower():
-            canonica = resolver_url(url_final, enlace.attr("href"))
-            break
+    canonica = _extraer_url_guardada(raiz, respuesta.html, metas, ld, url_final)
+    url_efectiva = canonica or url_final
 
-    nombre_sitio = _primero("og:site_name") or dominio(url_final)
+    nombre_sitio = _primero("og:site_name") or dominio(url_efectiva)
 
     return WebMetadata(
-        titulo=_limpiar_titulo(titulo, nombre_sitio, dominio(url_final)),
+        titulo=_limpiar_titulo(titulo, nombre_sitio, dominio(url_efectiva)),
         autor=_autor_de_json_ld(ld) or _primero("author", "article:author", "dc.creator"),
         descripcion=_primero("description", "og:description", "twitter:description"),
         keywords=_primero("keywords", "news_keywords"),
         sitio=nombre_sitio,
         idioma=idioma,
         url_solicitada=respuesta.url_solicitada,
-        url_final=canonica or url_final,
+        url_final=url_efectiva,
         estado_http=respuesta.estado_http,
         content_type=respuesta.content_type,
         sha256_html=respuesta.sha256,
@@ -542,6 +640,8 @@ def extraer_metadatos(raiz: Nodo, respuesta: Respuesta, opts: WebOptions) -> Web
                            or _primero("article:published_time", "date", "dc.date",
                                        "citation_publication_date")),
         fecha_captura=respuesta.fecha_captura,
+        fecha_archivo=respuesta.fecha_archivo,
+        ruta_local=respuesta.ruta_local,
         fecha_conversion=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
@@ -563,9 +663,11 @@ def extraer(respuesta: Respuesta, opts: Optional[WebOptions] = None,
     opts = opts or WebOptions()
     raiz = parsear(respuesta.html)
 
-    # Los metadatos se leen del arbol completo: el <head>, los <meta> y el
-    # JSON-LD viven justo en las ramas que la limpieza esta a punto de podar.
+    # Los metadatos y el posible motivo de escasez se leen del arbol completo: el
+    # <head>, los <meta> y los avisos de cookies/JS viven en las ramas que la
+    # limpieza esta a punto de podar.
     metadatos = extraer_metadatos(raiz, respuesta, opts)
+    motivo_previo = detectar_motivo_escaso(raiz, respuesta.html)
     base_url = metadatos.url_final or respuesta.url_solicitada
 
     if opts.quitar_cromo:
@@ -593,6 +695,8 @@ def extraer(respuesta: Respuesta, opts: Optional[WebOptions] = None,
     metadatos.chars_extraidos = len(texto_total)
     metadatos.bloques = len(bloques)
     metadatos.imagenes = ctx.imagenes
+    if metadatos.chars_extraidos < opts.min_chars_contenido:
+        metadatos.motivo_escaso = motivo_previo or "contenido insuficiente en el DOM"
     # Los enlaces de las celdas ya vienen renderizados como Markdown, sin span
     # propio que contar, asi que se suman aparte: si no, el recuento
     # diria menos enlaces de los que el documento realmente lleva.

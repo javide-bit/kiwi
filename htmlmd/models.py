@@ -18,6 +18,13 @@ from typing import List
 from pdfmd.models import Options
 
 
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+
 @dataclass
 class WebMetadata:
     """Procedencia y diagnostico de una pagina convertida."""
@@ -38,7 +45,9 @@ class WebMetadata:
     content_type: str = ""
     sha256_html: str = ""               # Huella del HTML crudo recibido
     fecha_publicacion: str = ""         # De metadatos del propio documento
-    fecha_captura: str = ""             # Cuando se descargo
+    fecha_captura: str = ""             # Cuando se descargo (vacia si es un fichero local)
+    fecha_archivo: str = ""             # mtime del .html local
+    ruta_local: str = ""                # Ruta del .html local convertido
     fecha_conversion: str = ""
 
     # Diagnostico. El equivalente web de `capa_texto`: aqui el modo de fallo no
@@ -50,6 +59,8 @@ class WebMetadata:
     imagenes: int = 0
     contenido: str = "completo"         # completo | escaso | ausente
     criterio_cuerpo: str = ""           # article | main | role=main | densidad | ...
+    motivo_escaso: str = ""             # cookie wall | login/paywall | JS | bloqueo anti-bot
+    alternativa_local: str = ""         # Ruta a .html local alternativo si la descarga salio escasa
     elementos_suprimidos: List[str] = field(default_factory=list)
     avisos: List[str] = field(default_factory=list)
 
@@ -60,6 +71,7 @@ class WebOptions:
 
     # Estructura
     incluir_frontmatter: bool = True
+    clean_mode: bool = False            # Modo visualmente limpio (frontmatter simple, sin avisos de diagnóstico)
     detectar_tablas: bool = True
     normalizar_listas: bool = True
     detectar_codigo: bool = True
@@ -78,13 +90,20 @@ class WebOptions:
     quitar_cromo: bool = True           # Poda nav/footer/cookies/compartir...
     solo_cuerpo: bool = True            # Se queda con <article>/<main>/mejor candidato
 
+    # Obsidian
+    obsidian_callouts: bool = False     # Renderiza notas y advertencias como callouts de Obsidian (> [!NOTE])
+    obsidian_wikilinks: bool = False    # Convierte enlaces relativos e internos en wikilinks de Obsidian ([[doc]])
+
     # Diagnostico
     avisar_contenido_escaso: bool = True
     min_chars_contenido: int = 500      # Por debajo -> "escaso" + aviso visible
+    proteger_salida_existente: bool = True  # No sobrescribir una salida previa mas larga con una captura escasa
 
     # Red
-    timeout: float = 20.0
-    user_agent: str = "Mozilla/5.0 (compatible; KIWI-htmlmd/1.0; +local)"
+    timeout: float = 15.0
+    reintentos: int = 2                 # Reintentos ante timeouts o errores transitorios (429, 5xx)
+    espera_reintento: float = 2.0       # Espera base en segundos entre reintentos
+    user_agent: str = BROWSER_USER_AGENT
     verificar_tls: bool = True
     max_bytes: int = 20 * 1024 * 1024   # Corta descargas desbocadas
 
@@ -98,6 +117,9 @@ class WebOptions:
         """
         return Options(
             include_frontmatter=False,   # htmlmd escribe su propio frontmatter
+            clean_mode=self.clean_mode,
+            obsidian_callouts=self.obsidian_callouts,
+            obsidian_wikilinks=self.obsidian_wikilinks,
             page_markers=False,
             mark_cover_end=False,
             insert_page_breaks=False,

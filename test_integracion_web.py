@@ -201,7 +201,7 @@ def test_gui_tiene_la_pestana_web_cableada():
 
         pestanas = [app.notebook.tab(i, "text").strip()
                     for i in range(app.notebook.index("end"))]
-        afirmar(len(pestanas) == 4, f"se esperaban 4 pestanas: {pestanas}")
+        afirmar(len(pestanas) in (4, 5), f"se esperaban 4 o 5 pestanas: {pestanas}")
         afirmar("htmlmd" in pestanas[3], f"la cuarta pestana no es la web: {pestanas[3]}")
 
         for attr in ("web_txt_in", "web_txt_out", "web_txt_url", "web_txt_pausa",

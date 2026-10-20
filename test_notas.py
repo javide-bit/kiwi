@@ -145,7 +145,7 @@ def test_limpieza_no_se_come_las_notas():
 
 
 def test_marcadores_de_pagina():
-    """Un marcador por página, correlativo, incluidas las páginas vacías."""
+    """Un marcador por página con contenido, con el número real (la vacía no lleva)."""
     d = tempfile.mkdtemp(prefix="kiwi_t_marc_")
     try:
         pdf = os.path.join(d, "doc.pdf")
@@ -159,7 +159,7 @@ def test_marcadores_de_pagina():
 
         md = pdf_to_markdown(pdf, os.path.join(d, "o.md"), options=Options())
         marcadores = re.findall(r"<!-- p\.(\d+) -->", md)
-        assert marcadores == ["1", "2", "3", "4"], f"Marcadores incorrectos: {marcadores}"
+        assert marcadores == ["1", "2", "4"], f"Marcadores incorrectos: {marcadores}"
 
         sin = pdf_to_markdown(pdf, os.path.join(d, "o2.md"), options=Options(page_markers=False))
         assert "<!-- p." not in sin, "Con la opcion desactivada no debe emitirse ninguno"
@@ -237,7 +237,8 @@ def test_fin_de_portada():
 
         con = pdf_to_markdown(construir(True), os.path.join(d, "a.md"), options=Options())
         assert "<!-- fin-de-portada -->" in con, "Deberia detectarse tras los creditos"
-        assert con.index("<!-- fin-de-portada -->") < con.index("Capitulo primero")
+        # rindex: el título del frontmatter también es "Capitulo primero"
+        assert con.index("<!-- fin-de-portada -->") < con.rindex("Capitulo primero")
 
         sin = pdf_to_markdown(construir(False), os.path.join(d, "b.md"), options=Options())
         assert "<!-- fin-de-portada -->" not in sin, "Sin creditos no debe marcar nada"

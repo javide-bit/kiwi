@@ -24,7 +24,8 @@
 
 ### 2. 📝 Conversor a Markdown (`pdfmd`)
 - **Hipervínculos conservados**: las anotaciones `/Link` del PDF se emiten como enlace Markdown (`[texto](url)`), partiendo el span cuando el enlace cubre solo unas palabras de la línea. Los enlaces son parte del contenido. Las URL que no consiguen anclarse a ningún texto no se pierden: quedan al pie de su página como `<!-- enlaces sin ancla (p.N) -->`.
-- **Diagnóstico de la capa de texto**: el frontmatter lleva siempre `chars_extraidos`, `chars_por_pagina` y `capa_texto` (`nativa` / `ocr` / `ausente`). Por debajo de 800 caracteres por página el documento se marca como `ausente` y además se escribe un **aviso visible en el cuerpo**, para que un PDF escaneado no pase por bueno en silencio.
+- **Diagnóstico de la capa de texto**: el frontmatter lleva siempre `chars_extraidos`, `chars_por_pagina` y `capa_texto` (`nativa` / `escasa` / `ocr` / `ausente`). Con menos de 100 caracteres por página de media, o con la mayoría de páginas vacías, el documento se marca como `ausente` y además se escribe un **aviso visible en el cuerpo**; entre 100 y 800 es `escasa` (diapositivas, informes con gráficos: texto real pero poco).
+- **OCR por defecto (`auto`, `spa+eng`)**: las páginas que parecen escaneadas (imagen grande y menos de 200 caracteres nativos) pasan por Tesseract; si aun así el documento sale `ausente`, se **reintenta con OCRmyPDF `--force-ocr`** (o Tesseract en todas las páginas) y se conserva el resultado si al menos duplica el texto. Los idiomas pedidos se filtran a los instalados en `tessdata`.
 - **Palabras partidas recompuestas**: una palabra cortada por el guión de fin de línea (`docu-` / `mentation`) vuelve a ser `documentation` —si no, `grep "documentation"` no lo encuentra—, mientras que `long-term`, `well-known` o `left-right` conservan su guión. El corte se cose aunque cruce bloque o salto de página.
 - **Extracción Estructurada**: Detecta jerarquías de títulos (`#`, `##`, `###`) basadas en el tamaño de fuente y estilo.
 - **Detección de Tablas**: Tablas nativas del PDF y regiones alineadas por espacios, convertidas a tablas Markdown estándar (`| Col 1 | Col 2 |`).
@@ -38,14 +39,27 @@
 - **Ligaduras deshechas**: Convierte `ﬁ`, `ﬂ`, `ﬃ` en sus letras reales, sin lo cual el Markdown no sería buscable.
 - **Nombres en slug ASCII**: `Informe Anual: Situación 2026's.pdf` → `informe-anual-situacion-2026s.md`.
 - **Metadatos YAML**: Frontmatter con título, autor, materia, palabras clave y fichero de origen, escapado para no romper el YAML. Incluye `idioma` detectado y `lineas_suprimidas`, la lista de cabeceras y pies borrados del cuerpo, para poder auditar la limpieza.
-- **Soporte OCR Local**: Detección automática de páginas escaneadas, OCR por página con Tesseract y OCR del documento completo con OCRmyPDF.
+- **Soporte OCR Local**: Detección automática de páginas escaneadas, OCR por página con Tesseract y OCR del documento completo con OCRmyPDF. La GUI comprueba al arrancar Tesseract, los idiomas `spa`/`fra`, OCRmyPDF y Ghostscript (`gswin64c`) y avisa de lo que falte.
 
-### 3. 📋 Conversión por lotes
+### 3. 📋 Conversión por lotes y Concurrencia Multihilo
 
+- **Concurrencia multihilo**: procesamiento paralelo de documentos en lotes mediante `ThreadPoolExecutor` (`--workers N`), acelerando drásticamente la conversión en procesadores multinúcleo tanto en `pdfmd` como en `htmlmd`.
 - **Reanudable**: se salta los PDF que ya tienen un `.md` cuyo `sha256_pdf` coincide. Una conversión de cientos de documentos no se reinicia desde cero porque falle uno a mitad. Si el PDF cambia, el hash deja de coincidir y se reconvierte.
-- **Manifiesto de control**: un TSV junto a la salida con `archivo`, `paginas`, `chars`, `chars_pag`, `capa_texto`, `enlaces` y `avisos`, **ordenado por caracteres por página ascendente**: las primeras filas son exactamente los documentos que hay que revisar a mano.
+- **Repetir con OCR**: relanzar un lote con OCR activo rehace los `.md` que salieron `ausente` sin OCR (`ocr_modo` en el frontmatter). En la GUI, al terminar se resume cuántos salieron nativa/OCR/escasa/sin texto y se ofrece repetir con OCR solo esos.
+- **Manifiesto de control**: un TSV junto a la salida con `archivo`, `entrada` (ruta del PDF), `paginas`, `chars`, `chars_pag`, `capa_texto`, `enlaces` y `avisos`, **ordenado por caracteres por página ascendente**: las primeras filas son exactamente los documentos que hay que revisar a mano.
+- **Índice interactivo (INDEX.md)**: para lotes web y estructurados, agrupa automáticamente las capturas por sección con enlaces directos, métricas y badges de estado.
 
-### 4. 🌐 Conversor Web a Markdown (`htmlmd`)
+### 4. 📰 Maquetación Multi-Columna y Papers Científicos
+
+- **Detección inteligente de columnas**: identifica medianiles (gutters) verticales y divide la página en franjas continuas, asegurando que papers científicos, artículos de revista y folletos se lean columna por columna en orden secuencial en lugar de mezclar líneas horizontales.
+- **Respeto a títulos y divisores**: los encabezados a ancho completo actúan como separadores de sección, ordenando el contenido superior, luego las columnas intermedias y finalmente las notas o conclusiones inferiores. Desactivable con `--no-columns`.
+
+### 5. 💎 Integración Avanzada con Obsidian
+
+- **Callouts nativos**: convierte cajas de notas, advertencias, consejos y peligros en sintaxis nativa de Obsidian (`> [!NOTE]`, `> [!WARNING]`, `> [!TIP]`, `> [!DANGER]`, etc.) con `--obsidian-callouts`.
+- **Wikilinks internos**: convierte hipervínculos relativos a otros documentos en sintaxis bidireccional `[[destino|texto]]` o `[[destino]]` mediante `--obsidian-wikilinks`.
+
+### 6. 🌐 Conversor Web a Markdown (`htmlmd`)
 
 Módulo hermano de `pdfmd`: comparte con él el modelo de bloques y el renderizador, de modo que un `.md` salido de una web y otro salido de un PDF **son el mismo formato**. Solo cambia la fase de extracción. No añade ninguna dependencia: todo se apoya en la biblioteca estándar.
 
@@ -69,11 +83,16 @@ Haz **doble clic en `KIWI.bat`** o ejecuta:
 python kiwi_app.py
 ```
 
-La interfaz cuenta con 4 pestañas:
-- **Pestaña 1 (Recolector)**: Para escanear carpetas y generar la copia limpia y el informe CSV.
-- **Pestaña 2 (Conversor a Markdown)**: Para convertir un PDF individual o una carpeta completa a Markdown.
-- **Pestaña 3 (Pipeline Completo)**: Para recolectar un árbol de carpetas y exportar directamente su versión en Markdown.
-- **Pestaña 4 (Web a Markdown)**: Para capturar una URL, un `.html` guardado o una lista entera de URLs.
+La interfaz incluye características visuales y operativas avanzadas:
+- **🌓 Modo Oscuro Completo**: Conmutador Dark/Light en la cabecera que recolorea toda la aplicación, widgets nativos, tablas, árbol de tareas y visor Markdown.
+- **📊 Tarjetas KPI de Métricas**: Monitorización en vivo en la cabecera con recuento de Documentos procesados, Páginas/URLs, Elementos ricos (tablas/imágenes) y Tiempo transcurrido.
+- **🗂️ Cola Interactiva de Tareas**: Tabla interactiva (`ttk.Treeview`) con estados en vivo (`⏳ En cola`, `⚙️ Procesando`, `✅ Generado`, `⏭️ Omitido`, `❌ Error`), clic derecho y doble clic para ver el Markdown resultante.
+- **🎯 Drag & Drop (Arrastrar y Soltar)**: Arrastra cualquier archivo PDF, HTML o carpeta sobre la ventana para auto-seleccionar la pestaña y rellenar las rutas automáticamente.
+- **Pestaña 1 (Recolector)**: Escaneo de carpetas, deduplicación SHA-256 e informe CSV.
+- **Pestaña 2 (Conversor a Markdown)**: Conversión individual o en lote de PDFs con selector de hilos concurrentes, multicolumna y opciones Obsidian.
+- **Pestaña 3 (Pipeline Completo)**: Recolección y conversión secuencial en un único paso.
+- **Pestaña 4 (Web a Markdown)**: Captura de URLs o listas estructuradas con descargas en paralelo.
+- **Pestaña 5 (Visor Markdown)**: Visor integrado con renderizado enriquecido (encabezados, negritas, cursivas, tablas, callouts, enlaces) y conmutador para ver código fuente raw o formateado.
 
 Las rutas y las opciones marcadas se recuerdan entre sesiones en `~/.kiwi_config.json`.
 
@@ -97,25 +116,41 @@ Lote a partir de un fichero con una URL por línea (admite comentarios con `#`):
 ```bash
 python kiwi_app.py web --lista urls.txt -o salida/ --pausa 2
 ```
+La lista admite también `.html` ya guardados con su procedencia, sin volver a
+descargarlos: `ruta.html ; https://url-original` o `https://url-original | ruta.html`
+(una ruta sola, o con la URL vacía, se convierte sin `url_origen`). El frontmatter
+lleva `sha256` del HTML, `source_file` y `fecha_archivo`. Con `--conservar-nombre`
+el `.md` se llama como el fichero de entrada.
 Opciones: `--no-frontmatter`, `--no-tables`, `--no-links`, `--no-code-blocks`,
-`--no-slug`, `--no-alt`, `--pagina-completa` (no podar nada), `--timeout`,
-`--user-agent`, `--insecure`, `--refrescar`.
+`--no-slug` (o `--conservar-nombre`), `--no-alt`, `--pagina-completa` (no podar nada), `--modo-limpio` (o `--clean`),
+`--workers N` (concurrencia multihilo), `--obsidian-callouts`, `--obsidian-wikilinks`,
+`--timeout`, `--user-agent`, `--insecure`, `--refrescar`.
 
 #### 1. Conversión de PDF a Markdown:
 ```bash
 python kiwi_app.py convert documento.pdf -o documento.md --export-images
 ```
+O con el modo visualmente limpio (sin comentarios `<!-- p.N -->`, sin saltos `---`, frontmatter minimalista y párrafos unidos):
+```bash
+python kiwi_app.py convert documento.pdf -o documento.md --modo-limpio
+```
 O usando el CLI de `pdfmd`:
 ```bash
-python -m pdfmd.cli documento.pdf -o documento.md --export-images
+python -m pdfmd.cli documento.pdf -o documento.md --modo-limpio
 ```
 
-Opciones de conversión: `--ocr-mode {off,auto,tesseract,ocrmypdf}`, `--ocr-lang spa`,
-`--password`, `--preview-only`, `--insert-page-breaks`, `--no-tables`,
-`--no-equations`, `--no-headers-footers`, `--no-frontmatter`, `--no-code-blocks`,
-`--no-footnotes`, `--no-page-markers`, `--no-cover-mark`, `--no-hash`, `--no-slug`,
-`--no-links`, `--no-join-hyphens`, `--no-lang`, `--min-chars-pagina N`,
-`--url-origen`, `--fecha-captura`.
+Opciones de conversión: `--ocr-mode {off,auto,tesseract,ocrmypdf}` (por defecto `auto`), `--ocr-lang` (por defecto `spa+eng`),
+`--password`, `--preview-only`, `--insert-page-breaks`, `--modo-limpio` (o `--clean`),
+`--no-tables`, `--no-equations`, `--no-headers-footers`, `--no-frontmatter`,
+`--no-code-blocks`, `--no-footnotes`, `--no-page-markers`, `--no-cover-mark`,
+`--no-hash`, `--no-slug` (o `--conservar-nombre`: el `.md` se llama como el PDF), `--no-links`, `--no-join-hyphens`, `--no-lang`,
+`--no-columns` (desactiva reordenación multi-columna),
+`--obsidian-callouts`, `--obsidian-wikilinks`,
+`--workers N` (procesamiento multihilo concurrente en lotes),
+`--min-chars-pagina N` (por defecto 100), `--url-origen`, `--fecha-captura`.
+
+**Perfil Corpus** (botón en la pestaña de conversión): OCR `auto`, `spa+eng`, nombres originales,
+frontmatter completo y reanudación; se guarda en la configuración.
 
 #### Conversión por lotes
 
@@ -138,14 +173,18 @@ comando continúa donde se quedó; con `--no-reanudar` se reconvierte todo.
 El frontmatter permite decidir de qué ficheros fiarse sin abrir el PDF:
 
 ```yaml
+title: "Primer título del cuerpo"                    # si los metadatos no traen uno útil
+creation_date: "2008-02-10T07:59:13-05:00"          # ISO 8601
 url_origen: "https://ejemplo.org/2026/07/29/..."   # null si se desconoce
-fecha_captura: "2026-08-26"
+fecha_captura: "2026-08-26"                         # solo si se declara (--fecha-captura)
+fecha_archivo: "2026-08-26"                         # mtime del PDF en disco
 sha256_pdf: "fb379aefdb0f..."
 idioma: "en"
 chars_extraidos: 49926
 chars_por_pagina: 3120
-capa_texto: "nativa"        # nativa | ocr | ausente
+capa_texto: "nativa"        # nativa | escasa | ocr | ausente
 ocr_motor: null
+ocr_modo: "auto"            # modo de OCR con que se convirtió
 enlaces: 34
 lineas_suprimidas: ["Nombre de la Organización - Informe Anual"]
 ```
@@ -225,6 +264,9 @@ python run_tests.py
 - `test_mejoras.py` — mejoras de conversión: hipervínculos, detección de capa de texto, palabras partidas, nombre ASCII, manifiesto y lote reanudable.
 - `test_htmlmd.py` — conversor web: estructura, enlaces, limpieza de menús y pies, procedencia, imágenes, listas estructuradas y lote reanudable.
 - `test_integracion_web.py` — el conversor web dentro de la aplicación: interfaz gráfica, CLI y ejecutable.
+- `test_modo_limpio.py` — modo visualmente limpio: prosa unificada, eliminación de comentarios/saltos y frontmatter minimalista.
+- `test_corpus.py` — mejoras para conversión de corpus: OCR por defecto, capa escasa/ausente, fechas ISO, título, listas `ruta ; url`, sha256 en htmlmd, nombres originales, vallas de código y cabeceras repetidas.
+- `test_mejoras_v2.py` — 6 nuevas mejoras: concurrencia multihilo, multicolumna, Obsidian, visor Markdown, cola de tareas y modo oscuro/KPIs.
 
 ---
 
@@ -283,6 +325,8 @@ kiwi/
 ├── test_mejoras.py           # Pruebas de las mejoras de conversión
 ├── test_htmlmd.py            # Pruebas del conversor web
 ├── test_integracion_web.py   # Pruebas de integración del conversor web
+├── test_modo_limpio.py       # Pruebas del modo visualmente limpio
+├── test_mejoras_v2.py        # Pruebas de las 6 nuevas mejoras v2
 ├── requirements.txt          # Dependencias
 ├── LICENSE                   # Licencia MIT
 └── README.md                 # Documentación

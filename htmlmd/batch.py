@@ -6,19 +6,21 @@ Mismas dos garantias que el lote de PDF, por las mismas razones: una tanda de
 200 capturas no puede reiniciarse desde cero porque falle la numero 150, y al
 terminar hace falta saber de que ficheros fiarse sin abrirlos uno a uno.
 
-Soporta listados simples (una URL por linea) y listados estructurados
-en Markdown (con cualquier tipo de secciones, categorías, temas, enlaces locales
+Soporta listados simples (una URL por linea), CSV/TSV con `url;doc_id` o `ruta;url`,
+y listados estructurados en Markdown (con secciones, categorías, enlaces locales
 `[CAPTURA LOCAL]` y metadatos).
 """
 
+import concurrent.futures
 import csv
 import os
 import re
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from htmlmd.fetch import ErrorDeDescarga, es_url
 from htmlmd.models import WebOptions
@@ -40,16 +42,42 @@ class ItemLista:
     tipo: str = "url"            # "url" | "local"
     etiqueta: str = ""
     url_declarada: str = ""
+    nombre_salida: str = ""      # Nombre de salida explícito (ej. segunda columna doc_id en url;doc_id)
+
+
+def _limpiar_url_extraida(url: str) -> str:
+    """
+    Limpia puntuación final sobrante de una URL extraída de texto o Markdown sin
+    mutilar paréntesis equilibrados que formen parte de la URL (ej. Noname057(16)).
+    """
+    u = (url or "").strip().rstrip(".,;:")
+    while u.endswith(")") and u.count(")") > u.count("("):
+        u = u[:-1].rstrip(".,;:")
+    return u
+
+
+_CABECERAS_CSV = {
+    ("url", "doc_id"),
+    ("url", "id"),
+    ("url", "nombre"),
+    ("url", "archivo"),
+    ("ruta", "url"),
+    ("archivo", "url"),
+    ("origen", "url"),
+    ("origen", "doc_id"),
+    ("ruta", "doc_id"),
+    ("ruta", "url", "doc_id"),
+}
 
 
 def leer_lista_estructurada(ruta: str, base_dir: Optional[str] = None) -> List[ItemLista]:
     """
-    Lee un fichero de URLs o un listado Markdown/TXT enriquecido.
+    Lee un fichero de URLs, un CSV `url;doc_id` / `ruta;url` o un listado Markdown/TXT enriquecido.
 
     Extrae secciones genéricas desde encabezados Markdown (p.ej. `## Recetas — 12 enlaces...` -> `"Recetas"`,
     `## Viajes` -> `"Viajes"`), capturas locales (`[CAPTURA LOCAL] path/to/file.html`),
-    URLs crudas o en enlaces Markdown, resolviendo rutas locales y descartando comentarios
-    y metadatos de cabecera. Adaptable a cualquier tipo de listado.
+    pares `ruta.html ; url` o `url ; doc_id`, y URLs crudas o en enlaces Markdown,
+    conservando paréntesis legítimos en las URLs (p.ej. `Noname057(16)`).
     """
     items: List[ItemLista] = []
     if base_dir is None:
@@ -99,26 +127,42 @@ def leer_lista_estructurada(ruta: str, base_dir: Optional[str] = None) -> List[I
                 ))
                 continue
 
-            # Comentarios tradicionales tipo #
-            if linea_str.startswith("#"):
+            # Ignorar fila de cabecera CSV/TSV si coincide con nombres de columna conocidos
+            partes_estructuradas = [
+                p.strip().strip("`'\"") for p in _RE_SEPARADOR_PAR.split(linea_str) if p.strip()
+            ]
+            if tuple(p.lower() for p in partes_estructuradas) in _CABECERAS_CSV:
                 continue
 
-            # Detección de URLs (http:// o https://)
-            urls = re.findall(r'https?://[^\s><"\'\)]+', linea_str)
+            # Analizar tuplas estructuradas: "ruta.html ; url", "url | ruta.html",
+            # "url ; doc_id", "ruta.html ; doc_id", "ruta.html ; url ; doc_id"
+            tupla = _analizar_fila_estructurada(linea_str, base_dir, seccion_actual)
+            if tupla is not None:
+                items.append(tupla)
+                continue
+
+            # "ruta.html ;" con la URL vacia: es una ruta sola, no se descarta
+            linea_str = linea_str.rstrip(" ;|\t")
+            # Quitar comentario final en línea ("https://b.com/2  # nota")
+            linea_sin_comentario = re.sub(r"\s+#\s+.*$", "", linea_str).strip()
+
+            # Detección de URLs (http:// o https://) respetando paréntesis internos como Noname057(16)
+            urls = re.findall(r'https?://[^\s><"\';|]+', linea_sin_comentario)
             if urls:
                 for url in urls:
-                    url_clean = url.rstrip(".,;)")
-                    items.append(ItemLista(
-                        origen=url_clean,
-                        seccion=seccion_actual,
-                        tipo="url",
-                        etiqueta=linea_str,
-                    ))
+                    url_clean = _limpiar_url_extraida(url)
+                    if url_clean:
+                        items.append(ItemLista(
+                            origen=url_clean,
+                            seccion=seccion_actual,
+                            tipo="url",
+                            etiqueta=linea_str,
+                        ))
                 continue
 
             # Detección de rutas locales directas a archivos HTML/htm
-            if linea_str.lower().endswith((".html", ".htm")):
-                path_clean = linea_str.split("#", 1)[0].strip().strip("`'\"")
+            if linea_sin_comentario.lower().endswith((".html", ".htm")):
+                path_clean = linea_sin_comentario.split("#", 1)[0].strip().strip("`'\"")
                 if path_clean:
                     abs_path = os.path.normpath(os.path.join(base_dir, path_clean))
                     items.append(ItemLista(
@@ -126,11 +170,116 @@ def leer_lista_estructurada(ruta: str, base_dir: Optional[str] = None) -> List[I
                         seccion=seccion_actual,
                         tipo="local",
                         etiqueta=path_clean,
-                        url_declarada=path_clean,
                     ))
                 continue
 
     return items
+
+
+_RE_SEPARADOR_PAR = re.compile(r"\s*[;|\t]\s*")
+_RE_DOC_ID_VALIDO = re.compile(r"^[A-Za-z0-9_\-\.]+$")
+
+
+def _es_html_local(cadena: str) -> bool:
+    return cadena.lower().endswith((".html", ".htm")) and not es_url(cadena)
+
+
+def _par_ruta_url(linea: str) -> Optional[Tuple[str, str]]:
+    """(ruta, url) si la linea es "ruta.html ; url" o "url | ruta.html"; si no, None."""
+    partes = [p.strip().strip("`'\"") for p in _RE_SEPARADOR_PAR.split(linea) if p.strip()]
+    if len(partes) != 2:
+        return None
+    a, b = partes
+    if es_url(b) and _es_html_local(a):
+        return a, _limpiar_url_extraida(b)
+    if es_url(a) and _es_html_local(b):
+        return b, _limpiar_url_extraida(a)
+    return None
+
+
+def _analizar_fila_estructurada(linea: str, base_dir: str, seccion: str) -> Optional[ItemLista]:
+    """
+    Interpreta filas con columnas separadas por ';', '|' o tabulador:
+    - ruta.html ; url
+    - url | ruta.html
+    - url ; doc_id
+    - ruta.html ; doc_id
+    - ruta.html ; url ; doc_id
+    """
+    if not any(sep in linea for sep in (";", "|", "\t")):
+        return None
+    partes = [p.strip().strip("`'\"") for p in _RE_SEPARADOR_PAR.split(linea) if p.strip()]
+    if len(partes) == 3:
+        a, b, c = partes
+        if _es_html_local(a) and es_url(b):
+            return ItemLista(
+                origen=os.path.normpath(os.path.join(base_dir, a)),
+                seccion=seccion,
+                tipo="local",
+                etiqueta=a,
+                url_declarada=_limpiar_url_extraida(b),
+                nombre_salida=c,
+            )
+        if es_url(a) and _es_html_local(b):
+            return ItemLista(
+                origen=os.path.normpath(os.path.join(base_dir, b)),
+                seccion=seccion,
+                tipo="local",
+                etiqueta=b,
+                url_declarada=_limpiar_url_extraida(a),
+                nombre_salida=c,
+            )
+        return None
+
+    if len(partes) != 2:
+        return None
+
+    a, b = partes
+    # Caso 1: ruta.html ; url  o  url | ruta.html
+    par = _par_ruta_url(linea)
+    if par:
+        path_clean, url = par
+        return ItemLista(
+            origen=os.path.normpath(os.path.join(base_dir, path_clean)),
+            seccion=seccion,
+            tipo="local",
+            etiqueta=path_clean,
+            url_declarada=url,
+        )
+
+    # Caso 2: url ; doc_id
+    if es_url(a) and not es_url(b) and not _es_html_local(b) and _RE_DOC_ID_VALIDO.match(b):
+        url_clean = _limpiar_url_extraida(a)
+        return ItemLista(
+            origen=url_clean,
+            seccion=seccion,
+            tipo="url",
+            etiqueta=b,
+            nombre_salida=b,
+        )
+
+    # Caso 3: doc_id ; url
+    if es_url(b) and not es_url(a) and not _es_html_local(a) and _RE_DOC_ID_VALIDO.match(a):
+        url_clean = _limpiar_url_extraida(b)
+        return ItemLista(
+            origen=url_clean,
+            seccion=seccion,
+            tipo="url",
+            etiqueta=a,
+            nombre_salida=a,
+        )
+
+    # Caso 4: ruta.html ; doc_id
+    if _es_html_local(a) and not es_url(b) and _RE_DOC_ID_VALIDO.match(b):
+        return ItemLista(
+            origen=os.path.normpath(os.path.join(base_dir, a)),
+            seccion=seccion,
+            tipo="local",
+            etiqueta=a,
+            nombre_salida=b,
+        )
+
+    return None
 
 
 def leer_lista(ruta: str) -> List[str]:
@@ -152,7 +301,7 @@ def _urls_ya_convertidas(output_dir: str) -> Dict[str, str]:
         return hechas
     for root, _, files in os.walk(output_dir):
         for nombre in files:
-            if not nombre.lower().endswith(".md") or nombre.upper() == "INDEX.MD":
+            if not nombre.lower().endswith(".md") or nombre.upper() in ("INDEX.MD", "_INDEX.MD"):
                 continue
             ruta_completa = os.path.join(root, nombre)
             rel_nombre = os.path.relpath(ruta_completa, output_dir).replace("\\", "/")
@@ -165,7 +314,7 @@ def _urls_ya_convertidas(output_dir: str) -> Dict[str, str]:
             if not m:
                 continue
             for linea in m.group(1).splitlines():
-                if linea.startswith(("url_origen:", "url_solicitada:")):
+                if linea.startswith(("url_origen:", "url_solicitada:", "ruta_origen:")):
                     valor = _desescapar_yaml(linea.split(":", 1)[1].strip().strip('"'))
                     if valor and valor != "null":
                         hechas[valor] = rel_nombre
@@ -190,9 +339,9 @@ def escribir_manifiesto(filas: List[Dict[str, str]], ruta: str) -> str:
 
 
 def escribir_indice(filas: List[Dict[str, str]], ruta_index: str,
-                           stats: Dict[str, int]) -> str:
+                    stats: Dict[str, int]) -> str:
     """
-    Genera un índice Markdown (INDEX.md) interactivo agrupado por secciones o categorías.
+    Genera un índice Markdown (INDEX.md / _INDEX.md) interactivo agrupado por secciones o categorías.
     """
     ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     secciones = defaultdict(list)
@@ -237,7 +386,7 @@ def escribir_indice(filas: List[Dict[str, str]], ruta_index: str,
                 link_url = "—"
 
             badge_estado = f"`{contenido}`"
-            if contenido == "completo":
+            if contenido in ("completo", "ok"):
                 badge_estado = "✅ `completo`"
             elif contenido in ("escaso", "ausente"):
                 badge_estado = "⚠️ `escaso`"
@@ -269,11 +418,17 @@ def convertir_lote(origenes: List[Union[str, ItemLista]], output_dir: str,
                    pausa: float = 1.0,
                    organizar_por_secciones: bool = True,
                    generar_index: bool = True,
-                   cancel_event=None) -> Dict[str, object]:
+                   cancel_event=None,
+                   max_workers: int = 4,
+                   item_cb: Optional[Callable[[str, Dict], None]] = None,
+                   conservar_nombre: bool = False,
+                   nombre_index: str = "INDEX.md") -> Dict[str, object]:
     """
     Convierte una lista de URLs, capturas locales u objetos `ItemLista` a Markdown.
 
     Soporta subcarpetas por sección/categoría y generación automática de `INDEX.md`.
+    Con `conservar_nombre` el .md se llama como el fichero o la URL de entrada,
+    sin pasar a ASCII ni tomar el título: el nombre sirve de clave.
     """
     opts = options or WebOptions()
     os.makedirs(output_dir, exist_ok=True)
@@ -282,28 +437,32 @@ def convertir_lote(origenes: List[Union[str, ItemLista]], output_dir: str,
     filas: List[Dict[str, str]] = []
     usados = set()
     convertidas = omitidas = fallidas = 0
+    completados = 0
     total = len(origenes)
+    lock = threading.Lock()
 
     def _log(mensaje: str) -> None:
         if log_cb:
             log_cb(mensaje)
 
-    for i, item in enumerate(origenes, start=1):
+    def _procesar_uno(i: int, item: Union[str, ItemLista]) -> None:
+        nonlocal convertidas, omitidas, fallidas, completados
         if cancel_event is not None and cancel_event.is_set():
-            _log("Lote cancelado por el usuario.")
-            break
-
-        if progress_cb:
-            progress_cb(i, total)
+            return
 
         if isinstance(item, ItemLista):
             origen = item.origen
             seccion = item.seccion
             url_declarada = item.url_declarada
+            nombre_fijo = (item.nombre_salida or "").strip()
         else:
             origen = str(item)
             seccion = getattr(opts, "seccion", "")
             url_declarada = ""
+            nombre_fijo = ""
+
+        if nombre_fijo and not nombre_fijo.lower().endswith(".md"):
+            nombre_fijo += ".md"
 
         # Determinar subcarpeta si organizar_por_secciones está activo
         if organizar_por_secciones and seccion:
@@ -316,74 +475,174 @@ def convertir_lote(origenes: List[Union[str, ItemLista]], output_dir: str,
         os.makedirs(target_dir, exist_ok=True)
 
         if origen in ya_hechas:
-            omitidas += 1
             rel_hecha = ya_hechas[origen]
-            _log(f"[{i}/{total}] Ya convertida, se omite: {origen} -> {rel_hecha}")
-            filas.append({
-                "archivo": rel_hecha, "seccion": seccion, "url": origen,
-                "chars": "0", "bloques": "0", "enlaces": "0", "imagenes": "0",
-                "contenido": "omitida", "criterio_cuerpo": "", "avisos": "Ya convertida previamente",
-            })
-            continue
+            with lock:
+                omitidas += 1
+                completados += 1
+                _log(f"[{completados}/{total}] Ya convertida, se omite: {origen} -> {rel_hecha}")
+                filas.append({
+                    "archivo": rel_hecha, "seccion": seccion, "url": origen,
+                    "chars": "0", "bloques": "0", "enlaces": "0", "imagenes": "0",
+                    "contenido": "omitida", "estado": "omitida",
+                    "criterio_cuerpo": "", "avisos": "Ya convertida previamente",
+                })
+                if progress_cb:
+                    progress_cb(completados, total)
+                if item_cb:
+                    item_cb("done", {
+                        "index": i,
+                        "origen": origen,
+                        "seccion": seccion,
+                        "salida": rel_hecha,
+                        "estado": "⏭️ Omitida",
+                        "detalle": "Ya convertida",
+                        "out_full": os.path.join(output_dir, rel_hecha),
+                    })
+            return
 
-        provisional = nombre_de_salida(origen)
+        with lock:
+            provisional = nombre_fijo or nombre_de_salida(origen, usar_slug=not conservar_nombre)
+            raiz_p, ext_p = os.path.splitext(provisional)
+            k = f"{sec_folder}/{provisional.lower()}"
+            np = 2
+            while k in usados:
+                provisional = f"{raiz_p}-{np}{ext_p}"
+                k = f"{sec_folder}/{provisional.lower()}"
+                np += 1
+            usados.add(k)
+
         destino = os.path.join(target_dir, provisional)
-
+        rel_provisional = os.path.relpath(destino, output_dir).replace("\\", "/")
         opts_item = replace(opts, seccion=seccion) if hasattr(opts, "seccion") else opts
+
+        if item_cb:
+            item_cb("start", {
+                "index": i,
+                "origen": origen,
+                "seccion": seccion,
+                "salida": provisional,
+            })
 
         try:
             _, meta = html_to_markdown(origen, destino, opts_item, log_cb=None,
                                         url_origen=url_declarada)
         except ErrorDeDescarga as ex:
-            fallidas += 1
-            _log(f"[{i}/{total}] FALLO: {ex}")
-            filas.append({"archivo": "", "seccion": seccion, "url": origen, "chars": "0", "bloques": "0",
-                          "enlaces": "0", "imagenes": "0", "contenido": "fallo",
-                          "criterio_cuerpo": "", "avisos": str(ex)})
-            continue
+            with lock:
+                fallidas += 1
+                completados += 1
+                _log(f"[{completados}/{total}] FALLO: {ex}")
+                filas.append({
+                    "archivo": rel_provisional, "seccion": seccion, "url": origen,
+                    "chars": "0", "bloques": "0", "enlaces": "0", "imagenes": "0",
+                    "contenido": "fallo", "estado": "fallo",
+                    "criterio_cuerpo": "", "avisos": str(ex),
+                })
+                if progress_cb:
+                    progress_cb(completados, total)
+                if item_cb:
+                    item_cb("done", {
+                        "index": i,
+                        "origen": origen,
+                        "seccion": seccion,
+                        "salida": provisional,
+                        "estado": "❌ Fallo",
+                        "detalle": str(ex)[:60],
+                        "out_full": "",
+                    })
+            return
         except Exception as ex:                      # noqa: BLE001 - un lote no se detiene
-            fallidas += 1
-            _log(f"[{i}/{total}] ERROR inesperado con {origen}: {ex}")
-            filas.append({"archivo": "", "seccion": seccion, "url": origen, "chars": "0", "bloques": "0",
-                          "enlaces": "0", "imagenes": "0", "contenido": "error",
-                          "criterio_cuerpo": "", "avisos": str(ex)})
-            continue
+            with lock:
+                fallidas += 1
+                completados += 1
+                _log(f"[{completados}/{total}] ERROR inesperado con {origen}: {ex}")
+                filas.append({
+                    "archivo": rel_provisional, "seccion": seccion, "url": origen,
+                    "chars": "0", "bloques": "0", "enlaces": "0", "imagenes": "0",
+                    "contenido": "error", "estado": "fallo",
+                    "criterio_cuerpo": "", "avisos": str(ex),
+                })
+                if progress_cb:
+                    progress_cb(completados, total)
+                if item_cb:
+                    item_cb("done", {
+                        "index": i,
+                        "origen": origen,
+                        "seccion": seccion,
+                        "salida": provisional,
+                        "estado": "❌ Error",
+                        "detalle": str(ex)[:60],
+                        "out_full": "",
+                    })
+            return
 
-        definitivo = nombre_de_salida(origen, meta)
+        definitivo = (provisional if (conservar_nombre or nombre_fijo)
+                      else nombre_de_salida(origen, meta))
         raiz, ext = os.path.splitext(definitivo)
         key_usado = f"{sec_folder}/{definitivo.lower()}"
-        n = 2
-        while key_usado in usados or (
-                definitivo != provisional
-                and os.path.exists(os.path.join(target_dir, definitivo))):
-            definitivo = f"{raiz}-{n}{ext}"
-            key_usado = f"{sec_folder}/{definitivo.lower()}"
-            n += 1
-        usados.add(key_usado)
+        with lock:
+            n = 2
+            # Si coincide con el provisional ya esta reservado: no se renombra a -2
+            while definitivo != provisional and (
+                    key_usado in usados
+                    or os.path.exists(os.path.join(target_dir, definitivo))):
+                definitivo = f"{raiz}-{n}{ext}"
+                key_usado = f"{sec_folder}/{definitivo.lower()}"
+                n += 1
+            usados.add(key_usado)
 
-        ruta_final = os.path.join(target_dir, definitivo)
-        if definitivo != provisional:
-            try:
-                os.replace(destino, ruta_final)
-            except OSError:
-                ruta_final = destino
-                definitivo = provisional
+            ruta_final = os.path.join(target_dir, definitivo)
+            if definitivo != provisional:
+                try:
+                    os.replace(destino, ruta_final)
+                except OSError:
+                    ruta_final = destino
+                    definitivo = provisional
 
-        convertidas += 1
-        aviso = "; ".join(meta.avisos)
-        rel_final = os.path.relpath(ruta_final, output_dir).replace("\\", "/")
-        _log(f"[{i}/{total}] {origen} -> {rel_final} "
-             f"({meta.chars_extraidos} chars, {meta.contenido})")
-        filas.append({
-            "archivo": rel_final, "seccion": seccion, "url": meta.url_final or origen,
-            "chars": str(meta.chars_extraidos), "bloques": str(meta.bloques),
-            "enlaces": str(meta.enlaces), "imagenes": str(meta.imagenes),
-            "contenido": meta.contenido, "criterio_cuerpo": meta.criterio_cuerpo,
-            "avisos": aviso,
-        })
+            convertidas += 1
+            completados += 1
+            aviso = "; ".join(meta.avisos)
+            rel_final = os.path.relpath(ruta_final, output_dir).replace("\\", "/")
+            estado_fila = "ok" if meta.contenido == "completo" else (
+                "escaso" if meta.contenido == "escaso" else "fallo"
+            )
+            _log(f"[{completados}/{total}] {origen} -> {rel_final} "
+                 f"({meta.chars_extraidos} chars, {meta.contenido})")
+            filas.append({
+                "archivo": rel_final, "seccion": seccion, "url": meta.url_final or origen,
+                "chars": str(meta.chars_extraidos), "bloques": str(meta.bloques),
+                "enlaces": str(meta.enlaces), "imagenes": str(meta.imagenes),
+                "contenido": meta.contenido, "estado": estado_fila,
+                "criterio_cuerpo": meta.criterio_cuerpo,
+                "avisos": aviso,
+            })
+            if progress_cb:
+                progress_cb(completados, total)
+            if item_cb:
+                item_cb("done", {
+                    "index": i,
+                    "origen": origen,
+                    "seccion": seccion,
+                    "salida": os.path.basename(ruta_final),
+                    "estado": "✅ Generado" if meta.contenido == "completo" else "⚠️ Escaso",
+                    "detalle": f"{meta.chars_extraidos:,} chars",
+                    "out_full": ruta_final,
+                })
 
-        if pausa > 0 and es_url(origen) and i < total:
+        if pausa > 0 and es_url(origen) and completados < total:
             time.sleep(pausa)
+
+    if max_workers > 1 and total > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_procesar_uno, i, item) for i, item in enumerate(origenes, start=1)]
+            for f in concurrent.futures.as_completed(futures):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+    else:
+        for i, item in enumerate(origenes, start=1):
+            if cancel_event is not None and cancel_event.is_set():
+                _log("Lote cancelado por el usuario.")
+                break
+            _procesar_uno(i, item)
 
     manifiesto = ""
     index_md = ""
@@ -393,7 +652,7 @@ def convertir_lote(origenes: List[Union[str, ItemLista]], output_dir: str,
         manifiesto = escribir_manifiesto(filas, os.path.join(output_dir, "manifiesto.tsv"))
         _log(f"Manifiesto escrito en: {manifiesto}")
         if generar_index:
-            index_md = escribir_indice(filas, os.path.join(output_dir, "INDEX.md"), stats)
+            index_md = escribir_indice(filas, os.path.join(output_dir, nombre_index or "INDEX.md"), stats)
             _log(f"Índice escrito en: {index_md}")
 
     _log(f"Lote terminado: {convertidas} convertidas, {omitidas} omitidas, "

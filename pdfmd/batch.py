@@ -7,6 +7,7 @@ no necesita: saber de cuales fiarse sin abrirlos uno a uno (el manifiesto) y que
 un fallo en el numero 150 no obligue a empezar por el primero (la reanudacion).
 """
 
+import concurrent.futures
 import os
 import re
 import threading
@@ -14,9 +15,9 @@ from typing import Callable, Dict, List, Optional
 
 from pdfmd.models import Options
 from pdfmd.pipeline import pdf_to_markdown
-from pdfmd.utils import sha256_fichero, slugify
+from pdfmd.utils import chequear_dependencias_ocr, sha256_fichero, slugify
 
-COLUMNAS = ("archivo", "paginas", "chars", "chars_pag", "capa_texto", "enlaces", "avisos")
+COLUMNAS = ("archivo", "entrada", "paginas", "chars", "chars_pag", "capa_texto", "enlaces", "avisos")
 
 _RE_CAMPO = re.compile(r'^([a-z0-9_]+):\s*(.*)$')
 
@@ -40,12 +41,14 @@ def leer_frontmatter(texto: str) -> Dict[str, str]:
     return campos
 
 
-def ya_convertido(md_path: str, sha256_pdf: str) -> bool:
+def ya_convertido(md_path: str, sha256_pdf: str, rehacer_ausentes: bool = False) -> bool:
     """
     True si ya existe un .md generado a partir de ESE mismo PDF.
 
     La comparacion es por hash y no por fecha o tamano: si el PDF se ha
     reemplazado por otra version, hay que reconvertirlo aunque se llame igual.
+    Con `rehacer_ausentes` (OCR activo) un .md que salio sin capa de texto y
+    sin OCR no cuenta como hecho: relanzar el lote con OCR tiene que rehacerlo.
     """
     if not sha256_pdf or not os.path.exists(md_path):
         return False
@@ -54,7 +57,14 @@ def ya_convertido(md_path: str, sha256_pdf: str) -> bool:
             cabecera = f.read(4096)
     except OSError:
         return False
-    return leer_frontmatter(cabecera).get("sha256_pdf", "") == sha256_pdf
+    fm = leer_frontmatter(cabecera)
+    if (rehacer_ausentes and fm.get("capa_texto") == "ausente"
+            and fm.get("ocr_modo", "off") in ("off", "")):
+        return False
+    fm_hash = fm.get("sha256_pdf", "")
+    if fm_hash:
+        return fm_hash == sha256_pdf
+    return os.path.getsize(md_path) > 0
 
 
 def ruta_de_salida(pdf_path: str, output_dir: str, usados: set, usar_slug: bool = True) -> str:
@@ -71,17 +81,29 @@ def ruta_de_salida(pdf_path: str, output_dir: str, usados: set, usar_slug: bool 
     return candidato
 
 
-def fila_de_manifiesto(nombre: str, md_texto: str) -> Dict[str, str]:
+def fila_de_manifiesto(nombre: str, md_texto: str, entrada: str = "") -> Dict[str, str]:
     fm = leer_frontmatter(md_texto)
-    avisos = fm.get("avisos", "")
+    avisos_raw = fm.get("avisos", "")
+    avisos_txt = ""
+    if avisos_raw and avisos_raw != "[]":
+        limpio = avisos_raw.strip("[]").replace('"', "").strip()
+        avisos_txt = limpio or "si"
+    capa = fm.get("capa_texto", "")
+    estado = "ok"
+    if capa in ("escasa",):
+        estado = "escaso"
+    elif capa in ("ausente", "error", "fallo"):
+        estado = "fallo"
     return {
         "archivo": nombre,
+        "entrada": entrada,
         "paginas": fm.get("pages", "0"),
         "chars": fm.get("chars_extraidos", "0"),
         "chars_pag": fm.get("chars_por_pagina", "0"),
-        "capa_texto": fm.get("capa_texto", ""),
+        "capa_texto": capa,
         "enlaces": fm.get("enlaces", "0"),
-        "avisos": "si" if avisos and avisos != "[]" else "",
+        "avisos": avisos_txt,
+        "estado": estado,
     }
 
 
@@ -114,63 +136,95 @@ def convertir_lote(
     log_cb: Optional[Callable[[str], None]] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None,
+    max_workers: int = 1,
 ) -> List[Dict[str, str]]:
     """
     Convierte una lista de PDFs y devuelve las filas del manifiesto.
 
     Con `reanudar` activo se saltan los que ya tienen un .md cuyo `sha256_pdf`
     coincide, de modo que relanzar el lote continua donde se quedo.
+    `max_workers` permite paralelizar la conversión entre múltiples hilos.
     """
     opts = options or Options()
     os.makedirs(output_dir, exist_ok=True)
+    if opts.ocr_mode != "off" and log_cb:
+        for av_ocr in chequear_dependencias_ocr():
+            log_cb(f"AVISO OCR: {av_ocr}")
     usados: set = set()
+    total = len(pdfs)
+
+    # Precalcular las rutas de salida para evitar colisiones de nombres
+    tareas = []
+    for indice, pdf in enumerate(pdfs, start=1):
+        salida = ruta_de_salida(pdf, output_dir, usados, usar_slug=usar_slug)
+        tareas.append((indice, pdf, salida, os.path.basename(salida)))
+
     filas: List[Dict[str, str]] = []
     saltados = 0
     fallidos = 0
-    total = len(pdfs)
+    completados = 0
+    lock = threading.Lock()
 
-    for indice, pdf in enumerate(pdfs, start=1):
+    def _procesar_una_tarea(item):
+        nonlocal saltados, fallidos, completados
+        indice, pdf, salida, nombre = item
         if cancel_event is not None and cancel_event.is_set():
-            if log_cb:
-                log_cb("Lote cancelado por el usuario.")
-            break
+            return None
 
-        salida = ruta_de_salida(pdf, output_dir, usados, usar_slug=usar_slug)
-        nombre = os.path.basename(salida)
-
-        if reanudar and opts.compute_hash and ya_convertido(salida, sha256_fichero(pdf)):
-            saltados += 1
-            try:
-                with open(salida, "r", encoding="utf-8") as f:
-                    filas.append(fila_de_manifiesto(nombre, f.read(8192)))
-            except OSError:
-                pass
-            if log_cb:
-                log_cb(f"[{indice}/{total}] Ya convertido, se omite: {nombre}")
-            if progress_cb:
-                progress_cb(indice, total)
-            continue
+        if reanudar and opts.compute_hash and ya_convertido(
+                salida, sha256_fichero(pdf), rehacer_ausentes=opts.ocr_mode != "off"):
+            with lock:
+                saltados += 1
+                completados += 1
+                try:
+                    with open(salida, "r", encoding="utf-8") as f:
+                        filas.append(fila_de_manifiesto(nombre, f.read(8192), pdf))
+                except OSError:
+                    pass
+                if log_cb:
+                    log_cb(f"[{completados}/{total}] Ya convertido, se omite: {nombre}")
+                if progress_cb:
+                    progress_cb(completados, total)
+            return
 
         try:
             md = pdf_to_markdown(pdf, salida, options=opts, log_cb=None,
                                  cancel_event=cancel_event)
-            filas.append(fila_de_manifiesto(nombre, md))
-            if log_cb:
-                log_cb(f"[{indice}/{total}] Convertido: {nombre}")
+            with lock:
+                filas.append(fila_de_manifiesto(nombre, md, pdf))
+                completados += 1
+                if log_cb:
+                    log_cb(f"[{completados}/{total}] Convertido: {nombre}")
+                if progress_cb:
+                    progress_cb(completados, total)
         except InterruptedError:
             if log_cb:
                 log_cb("Lote cancelado por el usuario.")
-            break
         except Exception as ex:
-            fallidos += 1
-            filas.append({"archivo": nombre, "paginas": "0", "chars": "0",
-                          "chars_pag": "0", "capa_texto": "error",
-                          "enlaces": "0", "avisos": str(ex)[:120]})
-            if log_cb:
-                log_cb(f"[{indice}/{total}] ERROR en {os.path.basename(pdf)}: {ex}")
+            with lock:
+                fallidos += 1
+                completados += 1
+                filas.append({"archivo": nombre, "entrada": pdf, "paginas": "0", "chars": "0",
+                              "chars_pag": "0", "capa_texto": "error",
+                              "enlaces": "0", "avisos": str(ex)[:120]})
+                if log_cb:
+                    log_cb(f"[{completados}/{total}] ERROR en {os.path.basename(pdf)}: {ex}")
+                if progress_cb:
+                    progress_cb(completados, total)
 
-        if progress_cb:
-            progress_cb(indice, total)
+    if max_workers > 1 and len(tareas) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_procesar_una_tarea, t) for t in tareas]
+            for f in concurrent.futures.as_completed(futures):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+    else:
+        for t in tareas:
+            if cancel_event is not None and cancel_event.is_set():
+                if log_cb:
+                    log_cb("Lote cancelado por el usuario.")
+                break
+            _procesar_una_tarea(t)
 
     if manifiesto:
         ruta = manifiesto if os.path.isabs(manifiesto) else os.path.join(output_dir, manifiesto)

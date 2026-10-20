@@ -7,6 +7,16 @@ REM ===========================================================
 setlocal
 cd /d "%~dp0"
 
+REM 0. Intenta primero con el entorno virtual del proyecto (.venv)
+if exist "%~dp0.venv\Scripts\pythonw.exe" (
+    start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0kiwi_app.py"
+    exit /b 0
+)
+if exist "%~dp0.venv\Scripts\python.exe" (
+    start "" "%~dp0.venv\Scripts\python.exe" "%~dp0kiwi_app.py"
+    exit /b 0
+)
+
 REM 1. Intenta con pythonw (para abrir directamente la ventana limpia sin consola)
 where pythonw >nul 2>nul
 if %errorlevel% equ 0 (

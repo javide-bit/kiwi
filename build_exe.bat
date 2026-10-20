@@ -8,28 +8,33 @@ REM ===========================================================
 setlocal
 cd /d "%~dp0"
 
-python -m PyInstaller --version >nul 2>nul
+set "PYTHON_EXE=python"
+if exist "%~dp0.venv\Scripts\python.exe" set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
+
+"%PYTHON_EXE%" -m PyInstaller --version >nul 2>nul
 if errorlevel 1 (
     echo Instalando PyInstaller...
-    python -m pip install pyinstaller || goto :error
+    "%PYTHON_EXE%" -m pip install pyinstaller || goto :error
 )
 
 echo.
 echo [1/2] Compilando la interfaz grafica KIWI.exe ...
-python -m PyInstaller --noconfirm --clean --onefile --windowed ^
+"%PYTHON_EXE%" -m PyInstaller --noconfirm --clean --onefile --windowed ^
     --name KIWI ^
     --icon "%~dp0assets\kiwi_logo.ico" ^
     --add-data "%~dp0assets;assets" ^
-    --distpath dist --workpath build --specpath build ^
+    --collect-all tkinterdnd2 ^
+    --distpath dist --workpath build --specpath . ^
     kiwi_app.py || goto :error
 
 echo.
 echo [2/2] Compilando la version de consola KIWI-cli.exe ...
-python -m PyInstaller --noconfirm --onefile --console ^
+"%PYTHON_EXE%" -m PyInstaller --noconfirm --onefile --console ^
     --name KIWI-cli ^
     --icon "%~dp0assets\kiwi_logo.ico" ^
     --add-data "%~dp0assets;assets" ^
-    --distpath dist --workpath build --specpath build ^
+    --collect-all tkinterdnd2 ^
+    --distpath dist --workpath build --specpath . ^
     kiwi_app.py || goto :error
 
 echo.

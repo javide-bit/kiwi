@@ -177,7 +177,8 @@ class DocumentMetadata:
     page_count: int = 0
     filename: str = ""
     url_origen: str = ""
-    fecha_captura: str = ""
+    fecha_captura: str = ""             # Solo si se declara: la mtime del fichero no es la captura
+    fecha_archivo: str = ""             # Fecha de modificacion del PDF en disco
     fecha_conversion: str = ""
     sha256_pdf: str = ""
     idioma: str = ""                    # ISO 639-1 detectado del cuerpo ("en", "es"...)
@@ -185,17 +186,20 @@ class DocumentMetadata:
     # vacio y nada avisa de que lo que se lee no es el documento.
     chars_extraidos: int = 0
     chars_por_pagina: int = 0
-    capa_texto: str = "nativa"          # nativa | ocr | ausente
+    capa_texto: str = "nativa"          # nativa | escasa | ocr | ausente
     ocr_motor: str = ""                 # p.ej. "tesseract" si capa_texto == ocr
+    ocr_modo: str = ""                  # Modo de OCR con que se convirtio (off, auto...)
     enlaces: int = 0                    # Hipervinculos emitidos en el Markdown
     lineas_suprimidas: List[str] = field(default_factory=list)
     avisos: List[str] = field(default_factory=list)
+    outline: List[Tuple[int, str, int]] = field(default_factory=list)
 
 
 @dataclass
 class Options:
-    ocr_mode: Literal["off", "auto", "tesseract", "ocrmypdf"] = "off"
-    ocr_lang: str = "eng"
+    # "auto": OCR en las paginas sin texto y reintento si el documento sale sin capa
+    ocr_mode: Literal["off", "auto", "tesseract", "ocrmypdf"] = "auto"
+    ocr_lang: str = "spa+eng"
     preview_only: bool = False
     preview_pages: int = 3
     caps_to_headings: bool = True
@@ -218,14 +222,15 @@ class Options:
     mark_cover_end: bool = True     # Emite <!-- fin-de-portada --> si lo detecta con certeza
     compute_hash: bool = True       # SHA-256 del PDF en el frontmatter
     url_origen: str = ""            # Si se deja vacio se intenta leer del propio fichero
-    fecha_captura: str = ""         # Si se deja vacio se usa la fecha del PDF en disco
+    fecha_captura: str = ""         # Fecha de descarga declarada; vacia si no consta
 
     # Enlaces: forman parte del contenido del documento, no son adorno.
     extract_links: bool = True          # Emite las anotaciones /Link como enlace Markdown
     # Diagnostico de la capa de texto
     detect_text_layer: bool = True      # Calcula chars/pagina y clasifica la capa de texto
     warn_no_text_layer: bool = True     # Inserta un aviso visible en el cuerpo del MD
-    min_chars_por_pagina: int = 800     # Por debajo se marca capa_texto: ausente
+    min_chars_por_pagina: int = 100     # Por debajo (o mayoria de paginas vacias): capa_texto ausente
+    escasa_chars_por_pagina: int = 800  # Por debajo: capa_texto escasa (diapositivas, graficos)
     detect_language: bool = True        # Idioma del cuerpo para el frontmatter
     join_hyphens: bool = True           # Une palabras partidas por guion de fin de linea
 
@@ -238,3 +243,13 @@ class Options:
 
     # Control de frontmatter
     include_suppressed_lines: bool = False  # Si es False, no vuelca las lineas suprimidas en el YAML
+
+    # Modo limpio visualmente
+    clean_mode: bool = False            # Si es True, genera Markdown visualmente limpio (sin comentarios <!-- p.N -->, sin saltos ---, frontmatter minimalista)
+
+    # Detección multi-columna
+    detect_columns: bool = True         # Detecta y reordena maquetación en múltiples columnas (papers)
+
+    # Integración con Obsidian
+    obsidian_callouts: bool = False     # Renderiza notas y advertencias como callouts de Obsidian (> [!NOTE])
+    obsidian_wikilinks: bool = False    # Convierte enlaces relativos e internos en wikilinks de Obsidian ([[doc]])

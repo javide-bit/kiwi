@@ -15,7 +15,7 @@ from collections import Counter
 from typing import Callable, List, Optional, Tuple
 
 from pdfmd.models import Block, Footnote, Line, Options, PageText, Span
-from pdfmd.transform import find_repetitive_headers_footers, is_page_number_line
+from pdfmd.transform import clave_de_repeticion, find_repetitive_headers_footers, is_page_number_line
 
 # Dígitos volados Unicode que algunos PDFs usan como llamada o como marcador
 SUPERINDICES = {"⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
@@ -164,7 +164,9 @@ def process_footnotes(
 
     # Los pies recurrentes comparten franja con las notas: hay que reconocerlos
     # aqui o acabarian pegados al final del texto de la ultima nota.
-    recurrentes = find_repetitive_headers_footers(pages) if options.remove_headers_footers else set()
+    # Con los numeros: "Nota especifica numero 1." y "... 2." son notas distintas
+    recurrentes = (find_repetitive_headers_footers(pages, con_numeros=True)
+                   if options.remove_headers_footers else set())
 
     todas: List[Footnote] = []
     contador = 0
@@ -180,7 +182,7 @@ def process_footnotes(
         actual: Optional[Footnote] = None
 
         for block, linea in candidatas:
-            if linea.text().strip() in recurrentes:
+            if clave_de_repeticion(linea.text(), con_numeros=True) in recurrentes:
                 continue
             apertura = _es_inicio_de_nota(linea, body_size, hay_raya)
             if apertura:

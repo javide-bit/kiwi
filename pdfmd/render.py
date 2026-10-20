@@ -58,9 +58,10 @@ def _url_markdown(url: str) -> str:
     return url
 
 
-def render_link(texto: str, url: str) -> str:
+def render_link(texto: str, url: str, options: Optional[Options] = None,
+                obsidian_wikilinks: Optional[bool] = None) -> str:
     """
-    Emite un enlace Markdown a partir del texto anclado y su destino.
+    Emite un enlace Markdown o Wikilink de Obsidian a partir del texto anclado y su destino.
 
     Si el ancla no sirve como texto visible (esta vacia o es la propia URL) se
     emite la URL suelta: perder el ancla es aceptable, perder la URL no.
@@ -68,12 +69,33 @@ def render_link(texto: str, url: str) -> str:
     visible = texto.strip()
     if not visible or visible.rstrip("/") == url.rstrip("/"):
         return f"<{url}>"
+
+    use_wikilinks = obsidian_wikilinks if obsidian_wikilinks is not None else (
+        getattr(options, "obsidian_wikilinks", False) if options else False
+    )
+
+    # Soporte para Wikilinks de Obsidian en enlaces internos / relativos
+    if use_wikilinks and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://|^mailto:", url):
+        destino = url
+        if destino.lower().endswith((".md", ".pdf")):
+            destino = os.path.splitext(destino)[0]
+        elif "#" in destino:
+            partes = destino.split("#", 1)
+            fich = partes[0]
+            if fich.lower().endswith((".md", ".pdf")):
+                fich = os.path.splitext(fich)[0]
+            destino = f"{fich}#{partes[1]}" if fich else f"#{partes[1]}"
+
+        if visible == destino or (destino.startswith("#") and visible == destino[1:]):
+            return f"[[{destino}]]"
+        return f"[[{destino}|{visible}]]"
+
     # Los corchetes del ancla cerrarian el enlace antes de tiempo
     visible = visible.replace("[", r"\[").replace("]", r"\]")
     return f"[{visible}]({_url_markdown(url)})"
 
 
-def render_line(line: Line) -> str:
+def render_line(line: Line, options: Optional[Options] = None) -> str:
     """
     Renderiza una linea agrupando los spans consecutivos que comparten destino,
     para que un enlace repartido en varios spans salga como un unico ancla.
@@ -89,7 +111,7 @@ def render_line(line: Line) -> str:
         if url_actual:
             izq = " " if render.startswith(" ") else ""
             der = " " if render.endswith(" ") else ""
-            partes.append(f"{izq}{render_link(render, url_actual)}{der}")
+            partes.append(f"{izq}{render_link(render, url_actual, options)}{der}")
         else:
             partes.append(render)
 
@@ -102,6 +124,55 @@ def render_line(line: Line) -> str:
         grupo.append(sp)
     _volcar()
     return "".join(partes)
+
+
+def to_obsidian_callout(lines_text: List[str]) -> List[str]:
+    """
+    Convierte un conjunto de líneas en un callout de Obsidian (> [!NOTE], > [!WARNING], etc.)
+    detectando prefijos semánticos comunes (Nota, Advertencia, Importante, etc.).
+    """
+    if not lines_text:
+        return []
+
+    callout_map = {
+        ("nota", "note", "nb"): "NOTE",
+        ("advertencia", "warning", "aviso", "atención", "atencion", "cuidado"): "WARNING",
+        ("importante", "important"): "IMPORTANT",
+        ("consejo", "tip", "sugerencia", "pista"): "TIP",
+        ("peligro", "danger", "error"): "DANGER",
+        ("ejemplo", "example"): "EXAMPLE",
+        ("información", "informacion", "info"): "INFO",
+        ("cita", "quote"): "QUOTE",
+    }
+
+    primer_texto = lines_text[0].lstrip("> ").strip()
+    m_existente = re.match(r"^\[!([A-Za-z]+)\]\s*(.*)", primer_texto)
+    if m_existente:
+        return [f"> {l.lstrip('> ').strip()}" for l in lines_text]
+
+    tipo_encontrado = None
+    resto_primera_linea = primer_texto
+
+    m = re.match(r"^([A-Za-záéíóúÁÉÍÓÚñÑ]+)[:\s\-–—]\s*(.*)", primer_texto)
+    if m:
+        palabra = m.group(1).lower()
+        for keys, tag in callout_map.items():
+            if palabra in keys:
+                tipo_encontrado = tag
+                resto_primera_linea = m.group(2).strip()
+                break
+
+    if not tipo_encontrado:
+        tipo_encontrado = "NOTE"
+
+    res = [f"> [!{tipo_encontrado}]"]
+    if resto_primera_linea:
+        res.append(f"> {resto_primera_linea}")
+    for l in lines_text[1:]:
+        clean_l = l.lstrip("> ").strip()
+        if clean_l:
+            res.append(f"> {clean_l}")
+    return res
 
 
 def escape_markdown_line(text: str) -> str:
@@ -162,6 +233,68 @@ def yaml_lista(valores: List[str]) -> str:
     return "[" + ", ".join(yaml_quote(v) for v in valores) + "]"
 
 
+def merge_adjacent_markdown_links(text: str) -> str:
+    """
+    Combina enlaces Markdown idénticos contiguos que fueron generados span a span
+    o línea a línea.
+    Ejemplo: [The](url) [Disinformation](url) -> [The Disinformation](url)
+    """
+    if not text or "[" not in text or "](" not in text:
+        return text
+    pattern = re.compile(r'\]\(([^)\n]+)\)[ \t]*\[(?=[^\]\n]+\]\(\1\))')
+    while True:
+        new_text = pattern.sub(' ', text)
+        if new_text == text:
+            break
+        text = new_text
+    return text
+
+
+_RE_LIST_ITEM = re.compile(
+    r"^(?:\s*[-*+]\s+|\s*\d+[\.\)]\s+|\s*-\s*\[[ xX]\]\s+|\s*[a-zA-Z][\.\)]\s+)"
+)
+
+
+def join_clean_text_lines(lines: List[str]) -> str:
+    """
+    Une líneas consecutivas de un mismo párrafo de prosa (incluidas las líneas
+    de continuación de un elemento de lista o párrafo numerado) respetando
+    elementos de lista, citas y sangrías.
+    """
+    if not lines:
+        return ""
+    partes = []
+    parrafo_actual = []
+
+    for l in lines:
+        stripped = l.strip()
+        if not stripped:
+            if parrafo_actual:
+                partes.append(merge_adjacent_markdown_links(" ".join(parrafo_actual)))
+                parrafo_actual = []
+            continue
+        es_lista = bool(_RE_LIST_ITEM.match(l))
+        es_cita = stripped.startswith(">")
+        es_regla = stripped == "---" or stripped.startswith("![")
+
+        if es_cita or es_regla:
+            if parrafo_actual:
+                partes.append(merge_adjacent_markdown_links(" ".join(parrafo_actual)))
+                parrafo_actual = []
+            partes.append(merge_adjacent_markdown_links(l.rstrip()))
+        elif es_lista:
+            if parrafo_actual:
+                partes.append(merge_adjacent_markdown_links(" ".join(parrafo_actual)))
+            parrafo_actual = [l.rstrip()]
+        else:
+            parrafo_actual.append(stripped)
+
+    if parrafo_actual:
+        partes.append(merge_adjacent_markdown_links(" ".join(parrafo_actual)))
+
+    return "\n".join(partes)
+
+
 def generate_yaml_frontmatter(metadata: Optional[DocumentMetadata], input_pdf_path: str,
                                options: Optional[Options] = None) -> str:
     """Genera el bloque YAML de metadatos para Obsidian/Jekyll/Pandoc."""
@@ -170,6 +303,26 @@ def generate_yaml_frontmatter(metadata: Optional[DocumentMetadata], input_pdf_pa
 
     source_name = metadata.filename or os.path.basename(input_pdf_path)
     title = metadata.title or os.path.splitext(source_name)[0]
+
+    if options and options.clean_mode:
+        lines = ["---", f"title: {yaml_quote(title)}"]
+        if metadata.author:
+            lines.append(f"author: {yaml_quote(metadata.author)}")
+        if metadata.creation_date:
+            lines.append(f"date: {yaml_quote(metadata.creation_date)}")
+        if metadata.subject:
+            lines.append(f"subject: {yaml_quote(metadata.subject)}")
+        if metadata.keywords:
+            lines.append(f"keywords: {yaml_quote(metadata.keywords)}")
+        if metadata.page_count:
+            lines.append(f"pages: {metadata.page_count}")
+        if metadata.url_origen:
+            lines.append(f"url_origen: {yaml_quote(metadata.url_origen)}")
+        # La huella permite emparejar el .md con su PDF tambien en modo limpio
+        if metadata.sha256_pdf:
+            lines.append(f"sha256_pdf: {yaml_quote(metadata.sha256_pdf)}")
+        lines.append("---\n")
+        return "\n".join(lines)
 
     lines = ["---", f"title: {yaml_quote(title)}"]
     if metadata.author:
@@ -189,6 +342,8 @@ def generate_yaml_frontmatter(metadata: Optional[DocumentMetadata], input_pdf_pa
         lines.append(f"url_origen: {yaml_quote(metadata.url_origen)}")
     if metadata.fecha_captura:
         lines.append(f"fecha_captura: {yaml_quote(metadata.fecha_captura)}")
+    if metadata.fecha_archivo:
+        lines.append(f"fecha_archivo: {yaml_quote(metadata.fecha_archivo)}")
     if metadata.fecha_conversion:
         lines.append(f"fecha_conversion: {yaml_quote(metadata.fecha_conversion)}")
     if metadata.sha256_pdf:
@@ -206,6 +361,8 @@ def generate_yaml_frontmatter(metadata: Optional[DocumentMetadata], input_pdf_pa
     lines.append(f"capa_texto: {yaml_quote(metadata.capa_texto or 'nativa')}")
     lines.append(f"ocr_motor: {yaml_quote(metadata.ocr_motor)}" if metadata.ocr_motor
                  else "ocr_motor: null")
+    if metadata.ocr_modo:
+        lines.append(f"ocr_modo: {yaml_quote(metadata.ocr_modo)}")
     lines.append(f"enlaces: {metadata.enlaces}")
     incluir_suprimidas = options.include_suppressed_lines if options else False
     if incluir_suprimidas and metadata.lineas_suprimidas:
@@ -288,7 +445,7 @@ def render_document(
     md_sections = []
     # Un fallo de capa de texto tiene que ser imposible de pasar por alto: el
     # frontmatter se lee si se busca, esto se ve al abrir el fichero.
-    if (options.warn_no_text_layer and metadata is not None
+    if (options.warn_no_text_layer and not options.clean_mode and metadata is not None
             and metadata.capa_texto == "ausente"):
         md_sections.append(AVISO_SIN_CAPA_TEXTO)
 
@@ -302,19 +459,19 @@ def render_document(
         page_md_blocks = []
 
         # Marca de corte entre los créditos y el cuerpo del documento
-        if options.mark_cover_end and page.fin_de_portada:
+        if options.mark_cover_end and not options.clean_mode and page.fin_de_portada:
             page_md_blocks.append("<!-- fin-de-portada -->")
 
         # Ancla de citación: el número real de página del PDF, en comentario HTML
-        # para que no ensucie el render. Se emite aunque la página venga vacía,
-        # o el índice dejaría de corresponderse con el original.
-        if options.page_markers:
+        # para que no ensucie el render. Una página vacía no lleva marca: el
+        # número de la siguiente sigue siendo el real, y no se ensucia el texto.
+        if options.page_markers and not options.clean_mode and page.blocks:
             page_md_blocks.append(f"<!-- p.{page.page_num} -->")
 
         for b in page.blocks:
             if b.block_type == "heading":
                 prefix = "#" * max(1, min(6, b.heading_level or 1))
-                text = b.text().strip()
+                text = merge_adjacent_markdown_links(b.text().strip())
                 page_md_blocks.append(f"{prefix} {text}")
 
             elif b.block_type == "table":
@@ -328,8 +485,12 @@ def render_document(
                 page_md_blocks.append(f"```{b.code_lang}\n{code_content}\n```")
 
             elif b.block_type == "quote":
-                quote_lines = [f"> {l.text().lstrip('> ').strip()}" for l in b.lines]
-                page_md_blocks.append("\n".join(quote_lines))
+                if options.obsidian_callouts:
+                    quote_lines = [l.text() for l in b.lines]
+                    page_md_blocks.append("\n".join(to_obsidian_callout(quote_lines)))
+                else:
+                    quote_lines = [f"> {l.text().lstrip('> ').strip()}" for l in b.lines]
+                    page_md_blocks.append("\n".join(quote_lines))
 
             elif b.block_type == "image":
                 if options.export_images and b.image_bytes:
@@ -344,9 +505,14 @@ def render_document(
                             reused_images += 1
 
             else:  # Texto normal o listas
-                block_lines_md = [escape_markdown_line(render_line(l)) for l in b.lines]
-                if block_lines_md:
-                    page_md_blocks.append("\n".join(block_lines_md))
+                rendered_lines = [escape_markdown_line(render_line(l, options)) for l in b.lines]
+                if (options.obsidian_callouts and b.block_type == "text" and rendered_lines and
+                        re.match(r"^(Nota|Note|Advertencia|Warning|Importante|Important|Aviso|Consejo|Tip|Peligro|Danger)[:\s\-–—]", rendered_lines[0].strip(), re.I)):
+                    page_md_blocks.append("\n".join(to_obsidian_callout(rendered_lines)))
+                else:
+                    joined_text = join_clean_text_lines(rendered_lines)
+                    if joined_text:
+                        page_md_blocks.append(joined_text)
 
         page_content = "\n\n".join(page_md_blocks).strip()
         if page_content:
@@ -355,13 +521,18 @@ def render_document(
     if reused_images and log_cb:
         log_cb(f"Imágenes repetidas reutilizadas sin duplicar fichero: {reused_images}")
 
-    separator = "\n\n---\n\n" if options.insert_page_breaks else "\n\n"
+    separator = "\n\n" if options.clean_mode else ("\n\n---\n\n" if options.insert_page_breaks else "\n\n")
     final_body = separator.join(md_sections)
 
     # 2. Todas las notas al pie del documento, al final y numeradas de corrido
     bloque_notas = render_footnotes([n for page in pages for n in page.footnotes])
     if bloque_notas:
-        final_body = f"{final_body}\n\n---\n\n{bloque_notas}"
+        sep_notas = "\n\n" if options.clean_mode else "\n\n---\n\n"
+        final_body = f"{final_body}{sep_notas}{bloque_notas}"
+
+    if options.clean_mode:
+        final_body = re.sub(r"\n{3,}", "\n\n", final_body)
+        final_body = "\n".join(l.rstrip() for l in final_body.splitlines())
 
     if options.include_frontmatter:
         fm = generate_yaml_frontmatter(metadata, output_md_path, options=options)

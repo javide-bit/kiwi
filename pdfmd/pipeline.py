@@ -4,6 +4,7 @@ pdfmd.pipeline — Orquestador principal del pipeline de conversión de PDF a Ma
 """
 
 import os
+import re
 import threading
 from typing import Callable, Optional
 
@@ -14,6 +15,36 @@ from pdfmd.models import Options
 from pdfmd.render import render_document
 from pdfmd.tables import process_tables
 from pdfmd.transform import marcar_fin_de_portada, transform_pages
+
+
+_RE_TITULO_BASURA = re.compile(
+    r"^(microsoft (word|powerpoint)|untitled|sin t[ií]tulo|document\d*|title)\b|\.(docx?|pptx?|indd|pdf)$",
+    re.IGNORECASE)
+
+
+def titulo_util(titulo: str, filename: str) -> bool:
+    """Un título de metadatos que es el nombre del fichero o un resto de Word no sirve."""
+    t = (titulo or "").strip()
+    if len(t) < 4 or _RE_TITULO_BASURA.search(t):
+        return False
+    return t.lower() != os.path.splitext(filename or "")[0].lower()
+
+
+def titulo_del_cuerpo(pages) -> str:
+    """
+    El título más destacado de las primeras páginas: el de menor nivel y, entre
+    ellos, el de letra más grande (la cabecera de la revista suele ir antes y
+    más pequeña que el título del artículo). A igualdad, el primero.
+    """
+    candidatos = [b for p in pages[:3] for b in p.blocks
+                  if b.block_type == "heading" and b.text().strip()]
+    if not candidatos:
+        return ""
+    def _peso(b):
+        tam = max((l.avg_size for l in b.lines), default=0.0)
+        return (-(b.heading_level or 9), round(tam, 1))
+    mejor = max(candidatos, key=_peso)
+    return " ".join(mejor.text().split())[:200]
 
 
 def _check_cancel(cancel_event: Optional[threading.Event], mensaje: str) -> None:
@@ -29,7 +60,8 @@ def pdf_to_markdown(
     log_cb: Optional[Callable[[str], None]] = None,
     pdf_password: Optional[str] = None,
     debug_tables: bool = False,
-    cancel_event: Optional[threading.Event] = None
+    cancel_event: Optional[threading.Event] = None,
+    url_origen: str = ""
 ) -> str:
     """
     Convierte un archivo PDF a Markdown estructurado aplicando el pipeline completo.
@@ -51,6 +83,9 @@ def pdf_to_markdown(
         progress_cb=progress_cb,
         cancel_event=cancel_event
     )
+
+    if url_origen and metadata:
+        metadata.url_origen = url_origen
 
     _check_cancel(cancel_event, "Operación cancelada por el usuario.")
 
@@ -79,6 +114,10 @@ def pdf_to_markdown(
     if log_cb:
         log_cb("Estructurando jerarquía de títulos, párrafos y bloques...")
     pages = transform_pages(pages, options=opts, log_cb=log_cb, metadata=metadata)
+
+    # El nombre del fichero ya va en source_file: como título vale más el del cuerpo
+    if metadata is not None and not titulo_util(metadata.title, metadata.filename):
+        metadata.title = titulo_del_cuerpo(pages) or ""
 
     # Marca de separación entre créditos y cuerpo (tras conocer los títulos)
     if opts.mark_cover_end:

@@ -11,8 +11,9 @@ from typing import Callable, List, Optional, Set
 from pdfmd.models import Block, DocumentMetadata, Line, Options, PageText, Span
 
 # Marcadores de viñeta habituales en PDFs que no son sintaxis Markdown válida
+# Marcadores de viñeta habituales en PDFs que no son sintaxis Markdown válida
 BULLET_CHARS = "•▪▫◦‣·∙●○–—"
-_RE_BULLET = re.compile(r"^([" + BULLET_CHARS + r"])\s*")
+_RE_BULLET = re.compile(r"^([" + BULLET_CHARS + r"\-\*])\s*")
 
 # Numeración de página aislada: "12", "- 12 -", "Página 3 de 40", "Page 3/40"
 _RE_PAGE_NUMBER = re.compile(
@@ -40,38 +41,50 @@ def detect_body_size(pages: List[PageText]) -> float:
     return float(most_common)
 
 
-def find_repetitive_headers_footers(pages: List[PageText]) -> Set[str]:
-    """Identifica textos que se repiten en la parte superior o inferior de múltiples páginas."""
+def clave_de_repeticion(texto: str, con_numeros: bool = False) -> str:
+    """
+    Forma comparable de una cabecera: sin espacios ni puntuacion
+    ("Q U A R T E R L Y" = "QUARTERLY") y, si es larga, sin numeros (el folio
+    cambia en cada pagina). En una corta los numeros se quedan: "Capitulo 1"
+    y "Capitulo 2" no son la misma cabecera.
+    """
+    if con_numeros:
+        return re.sub(r"[\W_]+", "", texto.lower())
+    sin_numeros = re.sub(r"[\W\d_]+", "", texto.lower())
+    if len(sin_numeros) >= 15:
+        return sin_numeros
+    return re.sub(r"[\W_]+", "", texto.lower())
+
+
+def find_repetitive_headers_footers(pages: List[PageText], con_numeros: bool = False) -> Set[str]:
+    """
+    Claves (ver `clave_de_repeticion`) de las lineas que se repiten en muchas
+    paginas: en los margenes (arriba, abajo o el lateral, donde va el sello
+    "Downloaded By..." en vertical) en >= 30 % de las paginas.
+    """
     if len(pages) < 2:
         return set()
 
-    top_texts = []
-    bottom_texts = []
+    en_margen: Counter = Counter()
 
     for page in pages:
         page_h = page.height or 842.0
+        page_w = page.width or 595.0
+        vistas_margen = set()
         for block in page.blocks:
             if block.block_type != "text":
                 continue
             for line in block.lines:
-                txt = line.text().strip()
-                if not txt:
+                clave = clave_de_repeticion(line.text(), con_numeros)
+                if len(clave) < 6:   # "Ibid." o una sigla no son cabeceras
                     continue
-                # Posición Y
-                _, y0, _, y1 = line.bbox
-                if y1 < page_h * 0.12:  # Top 12%
-                    top_texts.append(txt)
-                elif y0 > page_h * 0.88:  # Bottom 12%
-                    bottom_texts.append(txt)
+                x0, y0, x1, y1 = line.bbox
+                if (y1 < page_h * 0.12 or y0 > page_h * 0.88
+                        or x1 < page_w * 0.08 or x0 > page_w * 0.92):
+                    vistas_margen.add(clave)
+        en_margen.update(vistas_margen)
 
-    repetitive = set()
-    for texts_group in (top_texts, bottom_texts):
-        counts = Counter(texts_group)
-        for text, count in counts.items():
-            if count >= max(2, int(len(pages) * 0.4)):  # Presente en >= 40% de páginas
-                repetitive.add(text)
-
-    return repetitive
+    return {c for c, k in en_margen.items() if k >= max(2, int(len(pages) * 0.3))}
 
 
 def find_repetitive_header_footer_images(pages: List[PageText]) -> Set[str]:
@@ -127,11 +140,11 @@ def is_list_item(text: str) -> bool:
     """Detecta si una línea empieza con viñeta, número o checklist."""
     stripped = text.strip()
     patterns = [
-        r"^[" + BULLET_CHARS + r"\-\*]\s+",
-        r"^\-\s+\[[ xX]\]\s+",
-        r"^\d+[\.\)]\s+",
+        r"^[" + BULLET_CHARS + r"\-\*]\s*",
+        r"^\-\s+\[[ xX]\]\s*",
+        r"^\d+[\.\)]\s*",
         r"^[a-zA-Z][\.\)]\s+",
-        r"^\([a-zA-Z0-9]+\)\s+"
+        r"^\([a-zA-Z0-9]+\)\s*"
     ]
     return any(re.match(p, stripped) for p in patterns)
 
@@ -142,7 +155,7 @@ def is_quote_block(text: str) -> bool:
 
 
 def normalize_bullet(line: Line) -> None:
-    """Reescribe viñetas tipográficas (•, ▪, –) como guiones Markdown en el primer span."""
+    """Reescribe viñetas tipográficas (•, ▪, –, -) como guiones Markdown con espacio."""
     for span in line.spans:
         if not span.text.strip():
             continue
@@ -169,10 +182,64 @@ def merge_list_blocks(blocks: List[Block]) -> List[Block]:
     return merged
 
 
+def merge_heading_blocks(blocks: List[Block]) -> List[Block]:
+    """Une bloques de encabezado consecutivos del mismo nivel (# Titulo 1 + # Titulo 2 -> # Titulo 1 Titulo 2)."""
+    merged: List[Block] = []
+    for b in blocks:
+        if (merged and b.block_type == "heading" and merged[-1].block_type == "heading"
+                and b.heading_level == merged[-1].heading_level):
+            prev = merged[-1]
+            if prev.lines and b.lines:
+                prev.lines[-1].spans.append(Span(text=" "))
+                prev.lines[-1].spans.extend(b.lines[0].spans)
+                if len(b.lines) > 1:
+                    prev.lines.extend(b.lines[1:])
+            elif b.lines:
+                prev.lines.extend(b.lines)
+        else:
+            merged.append(b)
+    return merged
+
+
+def merge_broken_sentence_blocks(blocks: List[Block], options: Options) -> List[Block]:
+    """
+    Une bloques de texto consecutivos cuando el primero termina a mitad de frase
+    (sin punto final ni dos puntos) y el siguiente continúa la misma frase.
+    Evita que un párrafo quede partido en dos con un doble salto de línea artificial.
+    """
+    merged: List[Block] = []
+    for b in blocks:
+        if not merged:
+            merged.append(b)
+            continue
+        prev = merged[-1]
+        if (prev.block_type == "text" and b.block_type == "text"
+                and prev.lines and b.lines):
+            prev_txt = prev.text().rstrip()
+            next_txt = b.text().lstrip()
+            if (prev_txt and not prev_txt.endswith((".", "!", "?", ":", ";", "---", "…"))
+                    and not is_list_item(next_txt)
+                    and not is_quote_block(next_txt)):
+                dy = b.bbox[1] - prev.bbox[3] if (b.bbox and prev.bbox) else 0
+                if dy < 120.0:  # Dentro del flujo de la página
+                    prev.lines.extend(b.lines)
+                    prev.lines = unir_palabras_partidas(prev.lines, options)
+                    if prev.bbox and b.bbox:
+                        prev.bbox = (
+                            min(prev.bbox[0], b.bbox[0]),
+                            prev.bbox[1],
+                            max(prev.bbox[2], b.bbox[2]),
+                            b.bbox[3]
+                        )
+                    continue
+        merged.append(b)
+    return merged
+
+
 def _classify_heading(line: Line, body_size: float, options: Options) -> int:
     """Devuelve el nivel de encabezado (1-3) o 0 si la línea no es un título."""
     text = line.text().strip()
-    if not text:
+    if not text or sum(1 for c in text if c.isalpha()) < 2:
         return 0
     line_size = line.avg_size
 
@@ -188,6 +255,41 @@ def _classify_heading(line: Line, body_size: float, options: Options) -> int:
             return 2 if line.is_bold else 3
 
     return 0
+
+
+# Un titulo no termina en articulo, preposicion o conjuncion: "Y JOURNAL OF" es
+# un trozo de cabecera de revista, no un titulo.
+_PALABRAS_DE_ENLACE = {
+    "of", "the", "and", "or", "a", "an", "in", "on", "for", "to", "with", "by", "at",
+    "de", "del", "la", "el", "los", "las", "y", "o", "e", "en", "con", "por", "para",
+    "du", "des", "le", "les", "et", "au", "aux", "di", "della", "il", "und", "der", "die",
+}
+
+
+def _titulo_cortado(text: str) -> bool:
+    palabras = re.findall(r"[^\W\d_]+", text.lower())
+    if not palabras:
+        return True
+    return palabras[-1] in _PALABRAS_DE_ENLACE or text.rstrip().endswith((",", "-"))
+
+
+_RE_SINTAXIS_CODIGO = re.compile(
+    r"[{};]\s*$"                                        # fin de sentencia o bloque
+    r"|^\s*(def|class|import|function|var|let|const|elif|#include|#define)\s+\w"
+    r"|==|!=|=>|->|::|\+=|\$\(|</?[a-z]+[ >]"           # operadores, etiquetas
+    r"|\w\(.*\)\s*[:{;]?\s*$"                           # llamada sin espacio: f(x)
+)
+
+
+def parece_codigo(lines: List[Line]) -> bool:
+    """
+    Una fuente monoespaciada no basta: avisos legales, portadas mecanografiadas,
+    cuestionarios y transcripciones tambien la usan. Hace falta sintaxis de
+    programa en al menos dos lineas y en el 30 % de ellas.
+    """
+    textos = [l.text() for l in lines if l.text().strip()]
+    con_sintaxis = sum(1 for t in textos if _RE_SINTAXIS_CODIGO.search(t))
+    return con_sintaxis >= 2 and con_sintaxis / len(textos) >= 0.3
 
 
 # Palabras que aparecen como mitad de compuesto legitimo con guion interno
@@ -417,6 +519,90 @@ def unir_cortes_entre_bloques(pages: List[PageText], options: Options) -> None:
                        if b.block_type not in ("text", "list_item") or b.lines]
 
 
+def reordenar_bloques_multicolumna(page: PageText) -> List[Block]:
+    """
+    Detecta si una página presenta maquetación en múltiples columnas (habitual en papers
+    académicos y artículos científicos) y reordena los bloques para respetar el orden natural
+    de lectura: primero la columna izquierda completa de arriba a abajo, luego la derecha,
+    respetando los elementos de ancho completo (títulos, resúmenes o figuras que cruzan la página).
+    """
+    if len(page.blocks) < 3:
+        return page.blocks
+
+    page_w = page.width or (max(b.bbox[2] for b in page.blocks) if page.blocks else 600.0)
+    if page_w <= 0:
+        return page.blocks
+
+    mitad = page_w * 0.5
+    umbral_ancho_completo = page_w * 0.60
+
+    col_izq = []
+    col_der = []
+
+    for b in page.blocks:
+        x0, y0, x1, y1 = b.bbox
+        ancho = x1 - x0
+        if ancho >= umbral_ancho_completo:
+            continue
+        if x1 <= mitad + (page_w * 0.05):
+            col_izq.append(b)
+        elif x0 >= mitad - (page_w * 0.05):
+            col_der.append(b)
+
+    # Si no hay bloques en ambas columnas, no es una maquetación multi-columna
+    if not col_izq or not col_der:
+        return page.blocks
+
+    # Comprobar si hay solapamiento vertical real entre bloques de la izquierda y la derecha
+    hay_solapamiento = False
+    for b_izq in col_izq:
+        _, iy0, _, iy1 = b_izq.bbox
+        for b_der in col_der:
+            _, dy0, _, dy1 = b_der.bbox
+            if max(iy0, dy0) < min(iy1, dy1) - 4:
+                hay_solapamiento = True
+                break
+        if hay_solapamiento:
+            break
+
+    if not hay_solapamiento:
+        return page.blocks
+
+    # Dividir los bloques en franjas verticales delimitadas por bloques divisores (ancho completo)
+    bloques_ordenados_y = sorted(page.blocks, key=lambda blk: (blk.bbox[1], blk.bbox[0]))
+
+    franjas = []
+    franja_actual = []
+
+    for b in bloques_ordenados_y:
+        x0, y0, x1, y1 = b.bbox
+        es_divisor = (x1 - x0 >= umbral_ancho_completo) or (x0 < mitad * 0.75 and x1 > mitad * 1.25)
+        if es_divisor:
+            if franja_actual:
+                franjas.append(("columnas", franja_actual))
+                franja_actual = []
+            franjas.append(("divisor", [b]))
+        else:
+            franja_actual.append(b)
+
+    if franja_actual:
+        franjas.append(("columnas", franja_actual))
+
+    resultado = []
+    for tipo, grupo in franjas:
+        if tipo == "divisor":
+            resultado.extend(grupo)
+        else:
+            izq = [b for b in grupo if b.bbox[0] < mitad]
+            der = [b for b in grupo if b.bbox[0] >= mitad]
+            izq_ordenado = sorted(izq, key=lambda b: (b.bbox[1], b.bbox[0]))
+            der_ordenado = sorted(der, key=lambda b: (b.bbox[1], b.bbox[0]))
+            resultado.extend(izq_ordenado)
+            resultado.extend(der_ordenado)
+
+    return resultado
+
+
 def transform_pages(
     pages: List[PageText],
     options: Options,
@@ -440,13 +626,13 @@ def transform_pages(
             log_cb(f"Encabezados/pies recurrentes detectados para suprimir: {len(rep_headers)}")
         if rep_images and log_cb:
             log_cb(f"Imágenes de cabecera/pie recurrentes detectadas para suprimir: {len(rep_images)}")
-        # Queda constancia en el frontmatter de que se ha borrado del cuerpo
-        if rep_headers and metadata is not None:
-            metadata.lineas_suprimidas = sorted(rep_headers)
 
     dropped_page_numbers = 0
+    suprimidas: Set[str] = set()
 
     for page in pages:
+        if options.detect_columns:
+            page.blocks = reordenar_bloques_multicolumna(page)
         new_blocks = []
         for block in page.blocks:
             if block.block_type == "table":
@@ -471,7 +657,8 @@ def transform_pages(
                 txt = line.text().strip()
                 if not txt:
                     continue
-                if options.remove_headers_footers and txt in rep_headers:
+                if options.remove_headers_footers and clave_de_repeticion(txt) in rep_headers:
+                    suprimidas.add(txt)
                     continue
                 if (options.drop_page_numbers and is_page_number_line(txt)
                         and in_margin_zone(line, page.height)):
@@ -482,15 +669,19 @@ def transform_pages(
             if not filtered_lines:
                 continue
 
-            # 1. Detección de bloques de código (monospace)
-            if options.detect_code_blocks and all(l.is_monospace for l in filtered_lines):
-                new_blocks.append(Block(
-                    lines=filtered_lines,
-                    block_type="code",
-                    bbox=block.bbox,
-                    page_num=page.page_num
-                ))
-                continue
+            # 1. Detección de bloques de código: monospace Y aspecto de programa
+            if all(l.is_monospace for l in filtered_lines):
+                if options.detect_code_blocks and parece_codigo(filtered_lines):
+                    new_blocks.append(Block(
+                        lines=filtered_lines,
+                        block_type="code",
+                        bbox=block.bbox,
+                        page_num=page.page_num
+                    ))
+                    continue
+                # Prosa en fuente de maquina de escribir: sin `comillas` de codigo
+                for l in filtered_lines:
+                    l.spans = [replace(sp, monospace=False) for sp in l.spans]
 
             # 2. Detección de citas (quote)
             first_text = filtered_lines[0].text().strip()
@@ -544,7 +735,48 @@ def transform_pages(
                 page_num=page.page_num
             ))
 
-        page.blocks = merge_list_blocks(new_blocks) if options.normalize_lists else new_blocks
+        blks = merge_list_blocks(new_blocks) if options.normalize_lists else new_blocks
+        blks = merge_heading_blocks(blks)
+        # Tras unir los titulos partidos en dos lineas: el que sigue acabando en
+        # "of"/"de" es un trozo (cabecera de revista), no un titulo.
+        for b in blks:
+            if b.block_type == "heading" and _titulo_cortado(b.text()):
+                b.block_type, b.heading_level = "text", 0
+        blks = merge_broken_sentence_blocks(blks, options)
+        page.blocks = blks
+
+    # Queda constancia en el frontmatter de que se ha borrado del cuerpo
+    if suprimidas and metadata is not None:
+        metadata.lineas_suprimidas = sorted(suprimidas)
+
+    # Ningun titulo real se repite en el 30 % de las paginas (o >= 3 paginas): si ocurre, es cabecera
+    if len(pages) >= 3:
+        conteo_titulos: Counter = Counter()
+        for page in pages:
+            vistos_pag = {
+                clave_de_repeticion(b.text())
+                for b in page.blocks
+                if b.block_type == "heading" and len(clave_de_repeticion(b.text())) >= 4
+            }
+            conteo_titulos.update(vistos_pag)
+        umbral_tit = max(3, int(len(pages) * 0.3))
+        titulos_repetidos = {k for k, v in conteo_titulos.items() if v >= umbral_tit}
+        if titulos_repetidos:
+            for page in pages:
+                nuevos_b = []
+                for b in page.blocks:
+                    if b.block_type == "heading" and clave_de_repeticion(b.text()) in titulos_repetidos:
+                        if options.remove_headers_footers:
+                            continue
+                        b.block_type, b.heading_level = "text", 0
+                    nuevos_b.append(b)
+                page.blocks = nuevos_b
+
+    # Si el documento no tiene titulos (o casi ninguno) pero el PDF trae esquema de marcadores (outline), usarlo
+    if metadata is not None and getattr(metadata, "outline", None):
+        num_headings = sum(1 for p in pages for b in p.blocks if b.block_type == "heading")
+        if num_headings == 0 or (len(pages) >= 8 and num_headings < max(2, len(pages) // 10)):
+            aplicar_outline_pdf(pages, metadata.outline)
 
     # Los cortes que cruzan bloque o pagina solo pueden coserse cuando ya estan
     # todos los bloques en su orden definitivo.
@@ -554,6 +786,77 @@ def transform_pages(
         log_cb(f"Numeraciones de página suprimidas: {dropped_page_numbers}")
 
     return pages
+
+
+def aplicar_outline_pdf(pages: List[PageText], outline: List) -> int:
+    """
+    Promueve a encabezado los bloques cuyo texto coincide con el esquema de marcadores
+    (outline / TOC) del PDF o inserta el marcador al inicio de la página correspondiente
+    cuando el documento carece de títulos detectados por tamaño de fuente.
+    """
+    if not pages or not outline:
+        return 0
+    por_pagina = {}
+    for item in outline:
+        if len(item) < 3:
+            continue
+        nivel, titulo, pno = item[0], str(item[1] or "").strip(), int(item[2] or 0)
+        if not titulo or pno < 1:
+            continue
+        por_pagina.setdefault(pno, []).append((max(1, min(4, int(nivel or 1))), titulo))
+
+    aplicados = 0
+    total_headings_previos = sum(1 for p in pages for b in p.blocks if b.block_type == "heading")
+
+    for page in pages:
+        entradas = por_pagina.get(page.page_num, [])
+        if not entradas:
+            continue
+        for nivel, titulo in entradas:
+            clave_toc = clave_de_repeticion(titulo, con_numeros=True)
+            if not clave_toc:
+                continue
+            encontrado = False
+            for b in page.blocks:
+                if b.block_type == "heading":
+                    if clave_de_repeticion(b.text(), con_numeros=True) == clave_toc:
+                        encontrado = True
+                        break
+                    continue
+                if b.block_type != "text" or not b.lines:
+                    continue
+                primera_clave = clave_de_repeticion(b.lines[0].text(), con_numeros=True)
+                bloque_clave = clave_de_repeticion(b.text(), con_numeros=True)
+                if bloque_clave == clave_toc:
+                    b.block_type = "heading"
+                    b.heading_level = nivel
+                    aplicados += 1
+                    encontrado = True
+                    break
+                if primera_clave == clave_toc and len(b.lines) > 1:
+                    encabezado = Block(
+                        lines=[b.lines[0]],
+                        block_type="heading",
+                        heading_level=nivel,
+                        bbox=b.bbox,
+                        page_num=page.page_num,
+                    )
+                    b.lines = b.lines[1:]
+                    idx_b = page.blocks.index(b)
+                    page.blocks.insert(idx_b, encabezado)
+                    aplicados += 1
+                    encontrado = True
+                    break
+            if not encontrado and total_headings_previos == 0:
+                encabezado = Block(
+                    lines=[Line(spans=[Span(text=titulo)])],
+                    block_type="heading",
+                    heading_level=nivel,
+                    page_num=page.page_num,
+                )
+                page.blocks.insert(0, encabezado)
+                aplicados += 1
+    return aplicados
 
 
 # Terminos propios de la pagina de creditos / copyright de un libro o informe

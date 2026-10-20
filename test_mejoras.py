@@ -200,7 +200,7 @@ def test_manifiesto_ordenado():
         assert lineas[1].startswith("dudoso.md"), \
             "El documento con menos texto por pagina va primero: es el que hay que revisar"
         assert lineas[3].startswith("bueno.md"), "El mas denso va el ultimo"
-        assert len(lineas[0].split("\t")) == 7, "El TSV tiene siete columnas"
+        assert len(lineas[0].split("\t")) == 8, "El TSV tiene ocho columnas (con la entrada)"
         print("  -> PASSED: manifiesto ordenado por densidad de texto")
     finally:
         shutil.rmtree(d, ignore_errors=True)
